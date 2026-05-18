@@ -112,6 +112,7 @@ DEFAULT_CONFIG = {
         "language": "en",
         "haptic_level": 2,          # 0=subtle, 1=low, 2=medium, 3=high
         "haptic_enabled": True,     # global haptic on/off
+        "action_haptic": [],        # action IDs that fire haptic on press; empty = opt-in
     },
 }
 
@@ -232,21 +233,38 @@ def create_profile(cfg, name, label=None, copy_from="default", apps=None):
     return cfg
 
 
-def get_button_haptic(cfg, button, profile=None):
-    """Return True if haptic is enabled for this button in the given profile (default: True)."""
-    if profile is None:
-        profile = cfg.get("active_profile", "default")
-    profiles = cfg.get("profiles", {})
-    pdata = profiles.get(profile, profiles.get("default", {}))
-    return bool(pdata.get("button_haptic", {}).get(button, True))
+# Curated list of actions that may fire haptic feedback on button press.
+# Other actions (text editing, raw scroll, mouse buttons, etc.) never trigger
+# haptic regardless of mapping. Order here is the order shown in the picker UI.
+HAPTIC_ELIGIBLE_ACTIONS = [
+    "switch_scroll_mode",
+    "toggle_smart_shift",
+    "cycle_dpi",
+    "volume_mute",
+    "play_pause",
+    "next_track",
+    "prev_track",
+    "task_view",
+    "alt_tab",
+    "alt_shift_tab",
+    "win_d",
+]
 
 
-def set_button_haptic(cfg, button, enabled, profile=None):
-    """Set per-button haptic enabled flag in the given profile and save."""
-    if profile is None:
-        profile = cfg.get("active_profile", "default")
-    pdata = cfg.setdefault("profiles", {}).setdefault(profile, {})
-    pdata.setdefault("button_haptic", {})[button] = bool(enabled)
+def action_haptic_enabled(cfg, action_id):
+    """True if haptic should fire when action_id executes via a button press."""
+    return action_id in cfg.get("settings", {}).get("action_haptic", [])
+
+
+def set_action_haptic(cfg, action_id, enabled):
+    """Add or remove action_id from the global per-action haptic allowlist."""
+    lst = cfg.setdefault("settings", {}).setdefault("action_haptic", [])
+    if enabled:
+        if action_id not in lst:
+            lst.append(action_id)
+    else:
+        if action_id in lst:
+            lst.remove(action_id)
     save_config(cfg)
     return cfg
 
@@ -367,6 +385,11 @@ def _migrate(cfg):
         # v10 -> v11: add global haptic enabled flag.
         cfg.setdefault("settings", {}).setdefault("haptic_enabled", True)
         cfg["version"] = 11
+
+    if version < 12:
+        # v11 -> v12: add per-action haptic allowlist (empty = opt-in).
+        cfg.setdefault("settings", {}).setdefault("action_haptic", [])
+        cfg["version"] = 12
 
     cfg.setdefault("settings", {})
     cfg["settings"].setdefault("appearance_mode", "system")

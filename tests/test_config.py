@@ -31,7 +31,7 @@ class ConfigMigrationTests(unittest.TestCase):
 
         migrated = config._migrate(legacy)
 
-        self.assertEqual(migrated["version"], 10)
+        self.assertEqual(migrated["version"], 12)
         self.assertEqual(migrated["profiles"]["default"]["apps"], [])
         self.assertFalse(migrated["settings"]["invert_hscroll"])
         self.assertFalse(migrated["settings"]["invert_vscroll"])
@@ -73,7 +73,7 @@ class ConfigMigrationTests(unittest.TestCase):
 
         migrated = config._migrate(cfg)
 
-        self.assertEqual(migrated["version"], 10)
+        self.assertEqual(migrated["version"], 12)
         self.assertEqual(
             migrated["profiles"]["media"]["apps"],
             ["Microsoft.Media.Player.exe", "VLC.exe"],
@@ -112,8 +112,10 @@ class ConfigMigrationTests(unittest.TestCase):
             ):
                 loaded = config.load_config()
 
-        self.assertEqual(loaded["version"], 10)
+        self.assertEqual(loaded["version"], 12)
         self.assertEqual(loaded["settings"]["dpi"], 800)
+        self.assertEqual(loaded["settings"]["action_haptic"], [])
+        self.assertTrue(loaded["settings"]["haptic_enabled"])
         self.assertFalse(loaded["settings"]["start_at_login"])
         self.assertEqual(loaded["settings"]["gesture_threshold"], 50)
         self.assertEqual(loaded["settings"]["appearance_mode"], "system")
@@ -136,7 +138,7 @@ class ConfigMigrationTests(unittest.TestCase):
 
         migrated = config._migrate(legacy)
 
-        self.assertEqual(migrated["version"], 10)
+        self.assertEqual(migrated["version"], 12)
         self.assertTrue(migrated["settings"]["start_at_login"])
         self.assertEqual(
             migrated["profiles"]["default"]["mappings"]["mode_shift"],
@@ -162,7 +164,7 @@ class ConfigMigrationTests(unittest.TestCase):
 
         migrated = config._migrate(v8_cfg)
 
-        self.assertEqual(migrated["version"], 10)
+        self.assertEqual(migrated["version"], 12)
         self.assertEqual(
             migrated["profiles"]["default"]["mappings"]["actions_ring"], "none"
         )
@@ -190,9 +192,59 @@ class ConfigMigrationTests(unittest.TestCase):
 
         migrated = config._migrate(v9_cfg)
 
-        self.assertEqual(migrated["version"], 10)
+        self.assertEqual(migrated["version"], 12)
         self.assertEqual(migrated["profiles"]["default"]["button_haptic"], {})
         self.assertEqual(migrated["profiles"]["work"]["button_haptic"], {})
+
+    def test_migrate_v11_to_v12_adds_action_haptic_list(self):
+        v11_cfg = {
+            "version": 11,
+            "active_profile": "default",
+            "profiles": {
+                "default": {
+                    "label": "Default",
+                    "apps": [],
+                    "mappings": {"middle": "none", "actions_ring": "none"},
+                }
+            },
+            "settings": {"dpi": 1000, "haptic_level": 2, "haptic_enabled": True},
+        }
+
+        migrated = config._migrate(v11_cfg)
+
+        self.assertEqual(migrated["version"], 12)
+        self.assertEqual(migrated["settings"]["action_haptic"], [])
+        # existing haptic settings preserved
+        self.assertTrue(migrated["settings"]["haptic_enabled"])
+        self.assertEqual(migrated["settings"]["haptic_level"], 2)
+
+    def test_action_haptic_enabled_returns_false_when_missing(self):
+        cfg = {"settings": {"action_haptic": ["cycle_dpi"]}}
+        self.assertTrue(config.action_haptic_enabled(cfg, "cycle_dpi"))
+        self.assertFalse(config.action_haptic_enabled(cfg, "alt_tab"))
+
+    def test_set_action_haptic_adds_and_removes(self):
+        cfg = {"settings": {"action_haptic": []}}
+
+        with patch.object(config, "save_config", lambda c: c):
+            cfg = config.set_action_haptic(cfg, "cycle_dpi", True)
+            self.assertEqual(cfg["settings"]["action_haptic"], ["cycle_dpi"])
+
+            # Adding the same action twice is a no-op
+            cfg = config.set_action_haptic(cfg, "cycle_dpi", True)
+            self.assertEqual(cfg["settings"]["action_haptic"], ["cycle_dpi"])
+
+            cfg = config.set_action_haptic(cfg, "volume_mute", True)
+            self.assertEqual(
+                cfg["settings"]["action_haptic"], ["cycle_dpi", "volume_mute"]
+            )
+
+            cfg = config.set_action_haptic(cfg, "cycle_dpi", False)
+            self.assertEqual(cfg["settings"]["action_haptic"], ["volume_mute"])
+
+            # Removing a non-present action is a no-op
+            cfg = config.set_action_haptic(cfg, "cycle_dpi", False)
+            self.assertEqual(cfg["settings"]["action_haptic"], ["volume_mute"])
 
     def test_get_profile_for_app_matches_aliases(self):
         cfg = {

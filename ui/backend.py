@@ -14,7 +14,7 @@ from core.accessibility import is_process_trusted
 from core.config import (
     BUTTON_NAMES, load_config, save_config, get_active_mappings,
     PROFILE_BUTTON_NAMES, set_mapping, create_profile, delete_profile,
-    get_icon_for_exe, get_button_haptic, set_button_haptic,
+    get_icon_for_exe, HAPTIC_ELIGIBLE_ACTIONS, set_action_haptic,
 )
 from core import app_catalog
 from core.device_layouts import get_device_layout, get_manual_layout_choices
@@ -303,6 +303,30 @@ class Backend(QObject):
     @Property(bool, notify=hapticChanged)
     def hapticEnabled(self):
         return bool(self._cfg.get("settings", {}).get("haptic_enabled", True))
+
+    @Property(list, notify=hapticChanged)
+    def hapticEnabledActions(self):
+        """Actions in the user's haptic allowlist, in stored order."""
+        enabled = self._cfg.get("settings", {}).get("action_haptic", [])
+        result = []
+        for aid in enabled:
+            data = ACTIONS.get(aid)
+            if data:
+                result.append({"id": aid, "label": data["label"]})
+        return result
+
+    @Property(list, notify=hapticChanged)
+    def hapticAvailableActions(self):
+        """Eligible haptic actions the user has NOT yet enabled."""
+        enabled = set(self._cfg.get("settings", {}).get("action_haptic", []))
+        result = []
+        for aid in HAPTIC_ELIGIBLE_ACTIONS:
+            if aid in enabled:
+                continue
+            data = ACTIONS.get(aid)
+            if data:
+                result.append({"id": aid, "label": data["label"]})
+        return result
 
     @Property(bool, notify=settingsChanged)
     def startMinimized(self):
@@ -659,20 +683,13 @@ class Backend(QObject):
                 daemon=True, name="HapticTest"
             ).start()
 
-    @Slot(str, str, result=bool)
-    def buttonHapticEnabled(self, profileName, button):
-        """Return whether haptic is enabled for the given button in the given profile."""
-        profile = profileName or self._cfg.get("active_profile", "default")
-        return get_button_haptic(self._cfg, button, profile)
-
-    @Slot(str, str, bool)
-    def setButtonHaptic(self, profileName, button, enabled):
-        """Set per-button haptic enabled flag in the given profile."""
-        profile = profileName or self._cfg.get("active_profile", "default")
-        self._cfg = set_button_haptic(self._cfg, button, enabled, profile)
+    @Slot(str, bool)
+    def setActionHaptic(self, action_id, enabled):
+        """Toggle whether an action fires haptic feedback on button press."""
+        self._cfg = set_action_haptic(self._cfg, action_id, bool(enabled))
         if self._engine:
             self._engine.cfg = self._cfg
-        self.mappingsChanged.emit()
+        self.hapticChanged.emit()
 
     @Slot(bool)
     def setInvertVScroll(self, value):

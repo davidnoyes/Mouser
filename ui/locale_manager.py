@@ -25,6 +25,11 @@ _TRANSLATIONS = {
         "haptic.test_title": "Test Haptic",
         "haptic.test_desc": "Play a brief haptic pulse to preview the current intensity.",
         "haptic.test": "Test",
+        "haptic.actions_title": "Haptic for Actions",
+        "haptic.actions_desc": "Pick which actions fire haptic feedback. Click an action to move it between Enabled and Available.",
+        "haptic.actions_enabled": "Enabled",
+        "haptic.actions_available": "Available",
+        "haptic.actions_empty": "No actions selected. Pick from Available.",
         "haptic.experimental_note": "Haptic feedback support is experimental. Some settings may not take effect until the protocol is fully documented.",
 
         # Mouse page — profile list
@@ -206,6 +211,11 @@ _TRANSLATIONS = {
         "haptic.test_title": "\u6d4b\u8bd5\u89e6\u89c9",
         "haptic.test_desc": "\u64ad\u653e\u4e00\u6b21\u77ed\u6682\u7684\u89e6\u89c9\u8109\u51b2\u4ee5\u9884\u89c8\u5f53\u524d\u5f3a\u5ea6\u3002",
         "haptic.test": "\u6d4b\u8bd5",
+        "haptic.actions_title": "\u52a8\u4f5c\u89e6\u89c9\u53cd\u9988",
+        "haptic.actions_desc": "\u9009\u62e9\u54ea\u4e9b\u52a8\u4f5c\u89e6\u53d1\u89e6\u89c9\u53cd\u9988\u3002\u70b9\u51fb\u52a8\u4f5c\u53ef\u5728\u201c\u5df2\u542f\u7528\u201d\u548c\u201c\u53ef\u9009\u201d\u4e4b\u95f4\u79fb\u52a8\u3002",
+        "haptic.actions_enabled": "\u5df2\u542f\u7528",
+        "haptic.actions_available": "\u53ef\u9009",
+        "haptic.actions_empty": "\u672a\u9009\u62e9\u4efb\u4f55\u52a8\u4f5c\u3002\u8bf7\u4ece\u201c\u53ef\u9009\u201d\u4e2d\u6dfb\u52a0\u3002",
         "haptic.experimental_note": "\u89e6\u89c9\u53cd\u9988\u652f\u6301\u4e3a\u5b9e\u9a8c\u6027\u529f\u80fd\u3002\u90e8\u5206\u8bbe\u7f6e\u53ef\u80fd\u5728\u534f\u8bae\u5b8c\u5168\u6587\u6863\u5316\u540e\u624d\u751f\u6548\u3002",
 
         "mouse.profiles": "\u914d\u7f6e\u6587\u4ef6",
@@ -372,6 +382,11 @@ _TRANSLATIONS = {
         "haptic.test_title": "\u6e2c\u8a66\u89f8\u89ba",
         "haptic.test_desc": "\u64ad\u653e\u4e00\u6b21\u77ed\u66ab\u7684\u89f8\u89ba\u8108\u885d\u4ee5\u9810\u89bd\u76ee\u524d\u5f37\u5ea6\u3002",
         "haptic.test": "\u6e2c\u8a66",
+        "haptic.actions_title": "\u52d5\u4f5c\u89f8\u89ba\u56de\u994b",
+        "haptic.actions_desc": "\u9078\u64c7\u54ea\u4e9b\u52d5\u4f5c\u89f8\u767c\u89f8\u89ba\u56de\u994b\u3002\u9ede\u64ca\u52d5\u4f5c\u53ef\u5728\u300c\u5df2\u555f\u7528\u300d\u548c\u300c\u53ef\u9078\u300d\u4e4b\u9593\u79fb\u52d5\u3002",
+        "haptic.actions_enabled": "\u5df2\u555f\u7528",
+        "haptic.actions_available": "\u53ef\u9078",
+        "haptic.actions_empty": "\u672a\u9078\u64c7\u4efb\u4f55\u52d5\u4f5c\u3002\u8acb\u5f9e\u300c\u53ef\u9078\u300d\u4e2d\u52a0\u5165\u3002",
         "haptic.experimental_note": "\u89f8\u89ba\u56de\u994b\u652f\u63f4\u70ba\u5be6\u9a57\u6027\u529f\u80fd\u3002\u90e8\u5206\u8a2d\u5b9a\u53ef\u80fd\u5728\u5354\u5b9a\u5b8c\u5168\u6587\u4ef6\u5316\u5f8c\u624d\u751f\u6548\u3002",
 
         "mouse.profiles": "\u8a2d\u5b9a\u6a94",

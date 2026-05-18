@@ -294,6 +294,157 @@ Item {
 
             Item { width: 1; height: 16 }
 
+            // ── Per-Action Picker Card ───────────────────────────────
+            Rectangle {
+                id: actionsCard
+                opacity: backend.hapticEnabled ? 1.0 : 0.4
+                Behavior on opacity { NumberAnimation { duration: 150 } }
+                width: parent.width - 72
+                anchors.horizontalCenter: parent.horizontalCenter
+                height: actionsContent.implicitHeight + 40
+                radius: Theme.radius
+                color: hapticPage.theme.bgCard
+                border.width: 1
+                border.color: hapticPage.theme.border
+
+                Column {
+                    id: actionsContent
+                    anchors {
+                        left: parent.left
+                        right: parent.right
+                        top: parent.top
+                        margins: 20
+                    }
+                    spacing: 16
+
+                    Text {
+                        text: s["haptic.actions_title"] || "Haptic for Actions"
+                        font { family: uiState.fontFamily; pixelSize: 16; bold: true }
+                        color: hapticPage.theme.textPrimary
+                    }
+
+                    Text {
+                        text: s["haptic.actions_desc"]
+                              || "Pick which actions fire haptic feedback. Click an action to move it between Enabled and Available."
+                        font { family: uiState.fontFamily; pixelSize: 12 }
+                        color: hapticPage.theme.textSecondary
+                        wrapMode: Text.WordWrap
+                        width: parent.width
+                    }
+
+                    RowLayout {
+                        width: parent.width
+                        spacing: 16
+
+                        // ── Enabled column (left) ────────────────────
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredWidth: 1   // equal share
+                            Layout.alignment: Qt.AlignTop
+                            color: hapticPage.theme.bgElevated
+                            radius: 10
+                            border.width: 1
+                            border.color: hapticPage.theme.border
+                            implicitHeight: enabledCol.implicitHeight + 24
+
+                            Column {
+                                id: enabledCol
+                                anchors {
+                                    left: parent.left
+                                    right: parent.right
+                                    top: parent.top
+                                    margins: 12
+                                }
+                                spacing: 10
+
+                                Text {
+                                    text: s["haptic.actions_enabled"] || "Enabled"
+                                    font { family: uiState.fontFamily; pixelSize: 11;
+                                           capitalization: Font.AllUppercase; letterSpacing: 1 }
+                                    color: hapticPage.theme.textSecondary
+                                }
+
+                                Text {
+                                    visible: enabledFlow.children.length === 0
+                                    text: s["haptic.actions_empty"]
+                                          || "No actions selected. Pick from Available."
+                                    font { family: uiState.fontFamily; pixelSize: 12;
+                                           italic: true }
+                                    color: hapticPage.theme.textSecondary
+                                    wrapMode: Text.WordWrap
+                                    width: parent.width
+                                }
+
+                                Flow {
+                                    id: enabledFlow
+                                    width: parent.width
+                                    spacing: 8
+
+                                    Repeater {
+                                        model: backend.hapticEnabledActions
+                                        delegate: ActionChip {
+                                            actionId: modelData.id
+                                            actionLabel: modelData.label
+                                            isCurrent: true
+                                            enabled: backend.hapticEnabled
+                                            onPicked: backend.setActionHaptic(modelData.id, false)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ── Available column (right) ─────────────────
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredWidth: 1
+                            Layout.alignment: Qt.AlignTop
+                            color: hapticPage.theme.bgElevated
+                            radius: 10
+                            border.width: 1
+                            border.color: hapticPage.theme.border
+                            implicitHeight: availableCol.implicitHeight + 24
+
+                            Column {
+                                id: availableCol
+                                anchors {
+                                    left: parent.left
+                                    right: parent.right
+                                    top: parent.top
+                                    margins: 12
+                                }
+                                spacing: 10
+
+                                Text {
+                                    text: s["haptic.actions_available"] || "Available"
+                                    font { family: uiState.fontFamily; pixelSize: 11;
+                                           capitalization: Font.AllUppercase; letterSpacing: 1 }
+                                    color: hapticPage.theme.textSecondary
+                                }
+
+                                Flow {
+                                    width: parent.width
+                                    spacing: 8
+
+                                    Repeater {
+                                        model: backend.hapticAvailableActions
+                                        delegate: ActionChip {
+                                            actionId: modelData.id
+                                            actionLabel: modelData.label
+                                            isCurrent: false
+                                            enabled: backend.hapticEnabled
+                                            onPicked: backend.setActionHaptic(modelData.id, true)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Item { width: 1; height: 16 }
+
             // ── Experimental Note ────────────────────────────────────
             Rectangle {
                 width: parent.width - 72

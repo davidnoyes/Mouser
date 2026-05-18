@@ -14,7 +14,7 @@ from core.key_simulator import (
 from core.config import (
     load_config, get_active_mappings, get_profile_for_app,
     BUTTON_TO_EVENTS, GESTURE_DIRECTION_BUTTONS, save_config,
-    get_button_haptic,
+    action_haptic_enabled,
 )
 from core.app_detector import AppDetector
 from core.logi_devices import clamp_dpi
@@ -159,12 +159,6 @@ class Engine:
                     else:
                         self.hook.register(evt_type, self._make_handler(action_id, btn_key))
 
-    def _button_haptic_enabled(self, btn_key):
-        """Return True if haptic feedback is enabled for this button in the active profile."""
-        if not btn_key:
-            return True
-        return get_button_haptic(self.cfg, btn_key, self._current_profile)
-
     def _make_handler(self, action_id, btn_key=""):
         def handler(event):
             try:
@@ -180,16 +174,14 @@ class Engine:
                             "action_id": action_id,
                             "action_label": self._action_label(action_id),
                         })
-                        # Haptic confirmation when a gesture resolves to an action.
-                        if self._button_haptic_enabled(btn_key):
-                            self._play_haptic_async(7)  # COMPLETED
+                        # Gesture-resolved actions always confirm with a pulse.
+                        self._play_haptic_async(7)  # COMPLETED
                     elif event.event_type == "actions_ring_down":
-                        # Haptic detent feedback for each ring step.
-                        if self._button_haptic_enabled(btn_key):
-                            self._play_haptic_async(0)  # SHARP_STATE_CHANGE
+                        # Ring detents always click — discoverability feedback.
+                        self._play_haptic_async(0)  # SHARP_STATE_CHANGE
                     elif not event.event_type.endswith("_up"):
-                        # Regular button press — fire haptic immediately on down.
-                        if self._button_haptic_enabled(btn_key):
+                        # Regular button press — gated by per-action allowlist.
+                        if action_haptic_enabled(self.cfg, action_id):
                             wf = 3 if action_id == "cycle_dpi" else 1
                             self._play_haptic_async(wf)
                     if action_id == "toggle_smart_shift":
