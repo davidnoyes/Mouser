@@ -113,6 +113,8 @@ DEFAULT_CONFIG = {
         "haptic_level": 2,          # 0=subtle, 1=low, 2=medium, 3=high
         "haptic_enabled": True,     # global haptic on/off
         "action_haptic": [],        # action IDs that fire haptic on press; empty = opt-in
+        "button_haptic": [],        # button keys that fire haptic on press; empty = opt-in
+        "haptic_dedup": True,       # True = deduplicate pulses within 100ms window
     },
 }
 
@@ -269,6 +271,24 @@ def set_action_haptic(cfg, action_id, enabled):
     return cfg
 
 
+def button_haptic_enabled(cfg, button_key):
+    """True if haptic should fire when button_key is pressed."""
+    return button_key in cfg.get("settings", {}).get("button_haptic", [])
+
+
+def set_button_haptic(cfg, button_key, enabled):
+    """Add or remove button_key from the global per-button haptic allowlist."""
+    lst = cfg.setdefault("settings", {}).setdefault("button_haptic", [])
+    if enabled:
+        if button_key not in lst:
+            lst.append(button_key)
+    else:
+        if button_key in lst:
+            lst.remove(button_key)
+    save_config(cfg)
+    return cfg
+
+
 def delete_profile(cfg, name):
     """Delete a profile (cannot delete 'default')."""
     if name == "default":
@@ -390,6 +410,13 @@ def _migrate(cfg):
         # v11 -> v12: add per-action haptic allowlist (empty = opt-in).
         cfg.setdefault("settings", {}).setdefault("action_haptic", [])
         cfg["version"] = 12
+
+    if version < 13:
+        # v12 -> v13: add per-button haptic allowlist and dedup flag.
+        s = cfg.setdefault("settings", {})
+        s.setdefault("button_haptic", [])
+        s.setdefault("haptic_dedup", True)
+        cfg["version"] = 13
 
     cfg.setdefault("settings", {})
     cfg["settings"].setdefault("appearance_mode", "system")

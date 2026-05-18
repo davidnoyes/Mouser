@@ -15,6 +15,7 @@ from core.config import (
     BUTTON_NAMES, load_config, save_config, get_active_mappings,
     PROFILE_BUTTON_NAMES, set_mapping, create_profile, delete_profile,
     get_icon_for_exe, HAPTIC_ELIGIBLE_ACTIONS, set_action_haptic,
+    set_button_haptic,
 )
 from core import app_catalog
 from core.device_layouts import get_device_layout, get_manual_layout_choices
@@ -327,6 +328,37 @@ class Backend(QObject):
             if data:
                 result.append({"id": aid, "label": data["label"]})
         return result
+
+    _HAPTIC_BUTTON_EXCLUDE = {"hscroll_left", "hscroll_right"}
+
+    @Property(list, notify=hapticChanged)
+    def hapticEnabledButtons(self):
+        """Buttons in the per-button haptic allowlist, in stored order."""
+        enabled = self._cfg.get("settings", {}).get("button_haptic", [])
+        result = []
+        for key in enabled:
+            if key in self._HAPTIC_BUTTON_EXCLUDE:
+                continue
+            label = BUTTON_NAMES.get(key)
+            if label:
+                result.append({"key": key, "label": label})
+        return result
+
+    @Property(list, notify=hapticChanged)
+    def hapticAvailableButtons(self):
+        """Device buttons the user has NOT yet added to the haptic allowlist."""
+        enabled = set(self._cfg.get("settings", {}).get("button_haptic", []))
+        supported = self._effective_supported_buttons or set(BUTTON_NAMES.keys())
+        result = []
+        for key, label in BUTTON_NAMES.items():
+            if key in enabled or key not in supported or key in self._HAPTIC_BUTTON_EXCLUDE:
+                continue
+            result.append({"key": key, "label": label})
+        return result
+
+    @Property(bool, notify=hapticChanged)
+    def hapticDedup(self):
+        return bool(self._cfg.get("settings", {}).get("haptic_dedup", True))
 
     @Property(bool, notify=settingsChanged)
     def startMinimized(self):
@@ -687,6 +719,23 @@ class Backend(QObject):
     def setActionHaptic(self, action_id, enabled):
         """Toggle whether an action fires haptic feedback on button press."""
         self._cfg = set_action_haptic(self._cfg, action_id, bool(enabled))
+        if self._engine:
+            self._engine.cfg = self._cfg
+        self.hapticChanged.emit()
+
+    @Slot(str, bool)
+    def setButtonHaptic(self, button_key, enabled):
+        """Toggle whether a physical button fires haptic feedback on press."""
+        self._cfg = set_button_haptic(self._cfg, button_key, bool(enabled))
+        if self._engine:
+            self._engine.cfg = self._cfg
+        self.hapticChanged.emit()
+
+    @Slot(bool)
+    def setHapticDedup(self, enabled):
+        """Set whether overlapping haptic pulses are deduplicated."""
+        self._cfg.setdefault("settings", {})["haptic_dedup"] = bool(enabled)
+        save_config(self._cfg)
         if self._engine:
             self._engine.cfg = self._cfg
         self.hapticChanged.emit()

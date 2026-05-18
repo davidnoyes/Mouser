@@ -445,6 +445,213 @@ Item {
 
             Item { width: 1; height: 16 }
 
+            // ── Per-Button Picker Card ───────────────────────────────
+            Rectangle {
+                id: buttonsCard
+                opacity: backend.hapticEnabled ? 1.0 : 0.4
+                Behavior on opacity { NumberAnimation { duration: 150 } }
+                width: parent.width - 72
+                anchors.horizontalCenter: parent.horizontalCenter
+                height: buttonsContent.implicitHeight + 40
+                radius: Theme.radius
+                color: hapticPage.theme.bgCard
+                border.width: 1
+                border.color: hapticPage.theme.border
+
+                Column {
+                    id: buttonsContent
+                    anchors {
+                        left: parent.left
+                        right: parent.right
+                        top: parent.top
+                        margins: 20
+                    }
+                    spacing: 16
+
+                    Text {
+                        text: s["haptic.buttons_title"] || "Haptic per Button"
+                        font { family: uiState.fontFamily; pixelSize: 16; bold: true }
+                        color: hapticPage.theme.textPrimary
+                    }
+
+                    Text {
+                        text: s["haptic.buttons_desc"]
+                              || "Choose which buttons fire haptic feedback, in addition to the action picker above."
+                        font { family: uiState.fontFamily; pixelSize: 12 }
+                        color: hapticPage.theme.textSecondary
+                        wrapMode: Text.WordWrap
+                        width: parent.width
+                    }
+
+                    RowLayout {
+                        width: parent.width
+                        spacing: 16
+
+                        // ── Enabled column (left) ────────────────────
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredWidth: 1
+                            Layout.alignment: Qt.AlignTop
+                            color: hapticPage.theme.bgElevated
+                            radius: 10
+                            border.width: 1
+                            border.color: hapticPage.theme.border
+                            implicitHeight: btnEnabledCol.implicitHeight + 24
+
+                            Column {
+                                id: btnEnabledCol
+                                anchors {
+                                    left: parent.left
+                                    right: parent.right
+                                    top: parent.top
+                                    margins: 12
+                                }
+                                spacing: 10
+
+                                Text {
+                                    text: s["haptic.buttons_enabled"] || "Enabled"
+                                    font { family: uiState.fontFamily; pixelSize: 11;
+                                           capitalization: Font.AllUppercase; letterSpacing: 1 }
+                                    color: hapticPage.theme.textSecondary
+                                }
+
+                                Text {
+                                    visible: btnEnabledFlow.children.length === 0
+                                    text: s["haptic.buttons_empty"]
+                                          || "No buttons selected. Pick from Available."
+                                    font { family: uiState.fontFamily; pixelSize: 12;
+                                           italic: true }
+                                    color: hapticPage.theme.textSecondary
+                                    wrapMode: Text.WordWrap
+                                    width: parent.width
+                                }
+
+                                Flow {
+                                    id: btnEnabledFlow
+                                    width: parent.width
+                                    spacing: 8
+
+                                    Repeater {
+                                        model: backend.hapticEnabledButtons
+                                        delegate: ActionChip {
+                                            actionId: modelData.key
+                                            actionLabel: modelData.label
+                                            isCurrent: true
+                                            enabled: backend.hapticEnabled
+                                            onPicked: backend.setButtonHaptic(modelData.key, false)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ── Available column (right) ─────────────────
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredWidth: 1
+                            Layout.alignment: Qt.AlignTop
+                            color: hapticPage.theme.bgElevated
+                            radius: 10
+                            border.width: 1
+                            border.color: hapticPage.theme.border
+                            implicitHeight: btnAvailableCol.implicitHeight + 24
+
+                            Column {
+                                id: btnAvailableCol
+                                anchors {
+                                    left: parent.left
+                                    right: parent.right
+                                    top: parent.top
+                                    margins: 12
+                                }
+                                spacing: 10
+
+                                Text {
+                                    text: s["haptic.buttons_available"] || "Available"
+                                    font { family: uiState.fontFamily; pixelSize: 11;
+                                           capitalization: Font.AllUppercase; letterSpacing: 1 }
+                                    color: hapticPage.theme.textSecondary
+                                }
+
+                                Flow {
+                                    width: parent.width
+                                    spacing: 8
+
+                                    Repeater {
+                                        model: backend.hapticAvailableButtons
+                                        delegate: ActionChip {
+                                            actionId: modelData.key
+                                            actionLabel: modelData.label
+                                            isCurrent: false
+                                            enabled: backend.hapticEnabled
+                                            onPicked: backend.setButtonHaptic(modelData.key, true)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Item { width: 1; height: 16 }
+
+            // ── Dedup Toggle Card ────────────────────────────────────
+            Rectangle {
+                id: dedupCard
+                opacity: backend.hapticEnabled ? 1.0 : 0.4
+                Behavior on opacity { NumberAnimation { duration: 150 } }
+                width: parent.width - 72
+                anchors.horizontalCenter: parent.horizontalCenter
+                height: dedupRow.implicitHeight + 32
+                radius: Theme.radius
+                color: hapticPage.theme.bgCard
+                border.width: 1
+                border.color: hapticPage.theme.border
+
+                Column {
+                    id: dedupRow
+                    anchors {
+                        left: parent.left
+                        right: parent.right
+                        top: parent.top
+                        margins: 20
+                    }
+                    spacing: 6
+
+                    Row {
+                        width: parent.width
+
+                        Text {
+                            text: s["haptic.dedup_title"] || "Prevent Duplicate Haptics"
+                            font { family: uiState.fontFamily; pixelSize: 14; bold: true }
+                            color: hapticPage.theme.textPrimary
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: parent.width - dedupSwitch.width
+                        }
+
+                        Switch {
+                            id: dedupSwitch
+                            checked: backend.hapticDedup
+                            anchors.verticalCenter: parent.verticalCenter
+                            enabled: backend.hapticEnabled
+                            onToggled: backend.setHapticDedup(checked)
+                        }
+                    }
+
+                    Text {
+                        text: s["haptic.dedup_desc"]
+                              || "When two haptic events fire close together, play only one pulse. Disable to allow both."
+                        font { family: uiState.fontFamily; pixelSize: 12 }
+                        color: hapticPage.theme.textSecondary
+                        wrapMode: Text.WordWrap
+                        width: parent.width
+                    }
+                }
+            }
+
+            Item { width: 1; height: 16 }
+
             // ── Experimental Note ────────────────────────────────────
             Rectangle {
                 width: parent.width - 72
