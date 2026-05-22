@@ -1,9 +1,10 @@
-"""Cross-platform login startup: Windows HKCU Run and macOS LaunchAgent."""
+"""Cross-platform login startup helpers for Windows, macOS, and Linux."""
 
 import os
 import plistlib
 import subprocess
 import sys
+import tempfile
 
 # Windows
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -13,9 +14,15 @@ RUN_VALUE_NAME = "Mouser"
 MACOS_LAUNCH_AGENT_LABEL = "io.github.tombadash.mouser"
 MACOS_PLIST_NAME = f"{MACOS_LAUNCH_AGENT_LABEL}.plist"
 
+# Linux
+LINUX_DESKTOP_ENTRY_NAME = "io.github.tombadash.mouser.desktop"
+LINUX_DESKTOP_TEMPLATE_NAME = f"{LINUX_DESKTOP_ENTRY_NAME}.in"
+LINUX_AUTOSTART_DELAY_SECONDS = 15
+APP_DISPLAY_NAME = "Mouser"
+
 
 def supports_login_startup():
-    return sys.platform in ("win32", "darwin")
+    return sys.platform in ("win32", "darwin", "linux")
 
 
 def _quote_arg(s: str) -> str:
@@ -42,6 +49,158 @@ def _program_arguments():
     if getattr(sys, "frozen", False):
         return [exe]
     return [exe, os.path.abspath(sys.argv[0])]
+
+
+def _runtime_root_dir() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    script_path = os.path.abspath(sys.argv[0]) if sys.argv else os.path.abspath(__file__)
+    return os.path.dirname(script_path)
+
+
+def _source_checkout_python() -> str | None:
+    root_dir = _runtime_root_dir()
+    if sys.platform == "win32":
+        candidate = os.path.join(root_dir, ".venv", "Scripts", "python.exe")
+    else:
+        candidate = os.path.join(root_dir, ".venv", "bin", "python")
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        return candidate
+    return None
+
+
+def _desktop_exec_parts(*, force_show: bool = False):
+    if getattr(sys, "frozen", False):
+        args = [os.path.abspath(sys.executable)]
+        if force_show:
+            args.append("--show-window")
+        return args
+    script_path = os.path.abspath(sys.argv[0]) if sys.argv else os.path.abspath(__file__)
+    exe = _source_checkout_python() or os.path.abspath(sys.executable)
+    args = [exe, script_path]
+    if force_show:
+        args.append("--show-window")
+    return args
+
+
+def _desktop_exec_arg(arg: str) -> str:
+    if not arg:
+        return '""'
+    if all(ch not in arg for ch in ' \t\n"\\`$'):
+        return arg
+    escaped = (
+        arg.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("`", "\\`")
+        .replace("$", "\\$")
+    )
+    return f'"{escaped}"'
+
+
+def _desktop_exec_string(args: list[str]) -> str:
+    return " ".join(_desktop_exec_arg(arg) for arg in args)
+
+
+def _repo_root_dir() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _linux_template_path() -> str:
+    candidates = []
+    if getattr(sys, "frozen", False):
+        bundle_root = getattr(sys, "_MEIPASS", "")
+        if bundle_root:
+            candidates.append(os.path.join(bundle_root, "linux", LINUX_DESKTOP_TEMPLATE_NAME))
+        candidates.append(
+            os.path.join(_runtime_root_dir(), "linux", LINUX_DESKTOP_TEMPLATE_NAME)
+        )
+    candidates.append(
+        os.path.join(
+            _repo_root_dir(),
+            "packaging",
+            "linux",
+            LINUX_DESKTOP_TEMPLATE_NAME,
+        )
+    )
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return candidates[0]
+
+
+def _linux_desktop_path() -> str:
+    return os.path.expanduser(
+        os.path.join("~", ".local", "share", "applications", LINUX_DESKTOP_ENTRY_NAME)
+    )
+
+
+def _linux_autostart_path() -> str:
+    return os.path.expanduser(
+        os.path.join("~", ".config", "autostart", LINUX_DESKTOP_ENTRY_NAME)
+    )
+
+
+def _linux_icon_path() -> str:
+    runtime_icon = os.path.join(_runtime_root_dir(), "images", "logo_icon.png")
+    if os.path.isfile(runtime_icon):
+        return runtime_icon
+    return os.path.join(_repo_root_dir(), "images", "logo_icon.png")
+
+
+def _linux_source_path() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.abspath(sys.executable)
+    if sys.argv:
+        return os.path.abspath(sys.argv[0])
+    return os.path.join(_repo_root_dir(), "main_qml.py")
+
+
+def _linux_template_text() -> str:
+    with open(_linux_template_path(), "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _render_linux_desktop_entry(*, autostart: bool) -> str:
+    autostart_lines = ""
+    if autostart:
+        autostart_lines = "\n".join(
+            [
+                "X-GNOME-Autostart-enabled=true",
+                f"X-GNOME-Autostart-Delay={LINUX_AUTOSTART_DELAY_SECONDS}",
+                "Hidden=false",
+            ]
+        )
+    entry = _linux_template_text()
+    exec_parts = _desktop_exec_parts(force_show=not autostart)
+    replacements = {
+        "@APP_NAME@": APP_DISPLAY_NAME,
+        "@EXEC@": _desktop_exec_string(exec_parts),
+        "@TRY_EXEC@": exec_parts[0],
+        "@WORKDIR@": _runtime_root_dir(),
+        "@ICON@": _linux_icon_path(),
+        "@SOURCE_PATH@": _linux_source_path(),
+        "@AUTOSTART_LINES@": autostart_lines,
+    }
+    for placeholder, value in replacements.items():
+        entry = entry.replace(placeholder, value)
+    return entry.rstrip() + "\n"
+
+
+def _write_linux_desktop_entry(path: str, *, autostart: bool) -> None:
+    entry = _render_linux_desktop_entry(autostart=autostart)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(entry)
+    try:
+        os.chmod(path, 0o644)
+    except OSError:
+        pass
+
+
+def ensure_linux_launcher() -> str:
+    launcher_path = _linux_desktop_path()
+    _write_linux_desktop_entry(launcher_path, autostart=False)
+    return launcher_path
 
 
 def _get_winreg():
@@ -88,6 +247,70 @@ def _launchctl_run(args: list) -> subprocess.CompletedProcess:
     )
 
 
+def _launchctl_failure_message(action: str, result: subprocess.CompletedProcess) -> str:
+    details = (result.stderr or result.stdout or "").strip()
+    if details:
+        return f"launchctl {action} failed: {details}"
+    return f"launchctl {action} failed with exit code {result.returncode}"
+
+
+def _atomic_write_file(path: str, data: bytes) -> None:
+    directory = os.path.dirname(path) or "."
+    prefix = f".{os.path.basename(path)}."
+    fd, tmp_path = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = ""
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def _remove_file_if_present(path: str) -> None:
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def _restore_macos_plist(
+    plist_path: str,
+    previous_plist: bytes | None,
+    domain: str,
+) -> None:
+    if previous_plist is None:
+        _remove_file_if_present(plist_path)
+        return
+    _atomic_write_file(plist_path, previous_plist)
+    result = _launchctl_run(["launchctl", "bootstrap", domain, plist_path])
+    if result.returncode != 0:
+        raise RuntimeError(_launchctl_failure_message("restore bootstrap", result))
+
+
+def _restore_macos_plist_then_raise(
+    plist_path: str,
+    previous_plist: bytes | None,
+    domain: str,
+    exc: Exception,
+) -> None:
+    try:
+        _restore_macos_plist(plist_path, previous_plist, domain)
+    except Exception as restore_exc:
+        raise RuntimeError(
+            f"{exc}; additionally failed to restore the previous launch agent: {restore_exc}"
+        ) from exc
+    if isinstance(exc, RuntimeError):
+        raise exc
+    raise RuntimeError(f"failed to update launch agent: {exc}") from exc
+
+
 def _apply_macos(enabled: bool) -> None:
     if sys.platform != "darwin":
         return
@@ -98,21 +321,30 @@ def _apply_macos(enabled: bool) -> None:
 
     if enabled:
         os.makedirs(launch_agents_dir, exist_ok=True)
-        if os.path.isfile(plist_path):
+        plist_existed = os.path.isfile(plist_path)
+        previous_plist = None
+        if plist_existed:
+            try:
+                with open(plist_path, "rb") as f:
+                    previous_plist = f.read()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"failed to preserve existing launch agent: {exc}"
+                ) from exc
             _launchctl_run(["launchctl", "bootout", domain, plist_path])
         payload = {
             "Label": MACOS_LAUNCH_AGENT_LABEL,
             "ProgramArguments": _program_arguments(),
             "RunAtLoad": True,
         }
-        with open(plist_path, "wb") as f:
-            plistlib.dump(payload, f, fmt=plistlib.FMT_XML)
-        result = _launchctl_run(["launchctl", "bootstrap", domain, plist_path])
-        if result.returncode != 0:
-            print(
-                f"[startup] launchctl bootstrap failed: {result.stderr.strip()}",
-                file=sys.stderr,
-            )
+        new_plist = plistlib.dumps(payload, fmt=plistlib.FMT_XML)
+        try:
+            _atomic_write_file(plist_path, new_plist)
+            result = _launchctl_run(["launchctl", "bootstrap", domain, plist_path])
+            if result.returncode != 0:
+                raise RuntimeError(_launchctl_failure_message("bootstrap", result))
+        except Exception as exc:
+            _restore_macos_plist_then_raise(plist_path, previous_plist, domain, exc)
     else:
         if os.path.isfile(plist_path):
             _launchctl_run(["launchctl", "bootout", domain, plist_path])
@@ -126,6 +358,26 @@ def _apply_macos(enabled: bool) -> None:
             )
 
 
+def _apply_linux(enabled: bool) -> None:
+    if sys.platform != "linux":
+        return
+    autostart_path = _linux_autostart_path()
+    if enabled:
+        ensure_linux_launcher()
+        _write_linux_desktop_entry(autostart_path, autostart=True)
+        return
+    try:
+        os.remove(autostart_path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"[startup] failed to remove Linux autostart entry: {exc}", file=sys.stderr)
+    try:
+        ensure_linux_launcher()
+    except Exception as exc:
+        print(f"[startup] failed to refresh Linux launcher on disable: {exc}", file=sys.stderr)
+
+
 def apply_login_startup(enabled: bool) -> None:
     if not supports_login_startup():
         return
@@ -133,6 +385,8 @@ def apply_login_startup(enabled: bool) -> None:
         _apply_windows(enabled)
     elif sys.platform == "darwin":
         _apply_macos(enabled)
+    elif sys.platform == "linux":
+        _apply_linux(enabled)
 
 
 def sync_from_config(enabled: bool) -> None:

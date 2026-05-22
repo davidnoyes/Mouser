@@ -11,6 +11,8 @@ Requires:  pip install hidapi
 Falls back gracefully if the package or device are unavailable.
 """
 
+import os
+import stat
 import sys
 import queue
 import threading
@@ -23,22 +25,95 @@ from core.logi_devices import (
     resolve_device,
 )
 
+_HID_MODULE_NAME = None
 try:
-    import hid as _hid
+    # The PyPI hidapi Linux wheels expose `hid` as the libusb backend and
+    # `hidraw` as the hidraw backend. Bluetooth HID devices only work through
+    # hidraw, so prefer it on Linux and fall back to `hid` for source builds
+    # where `hid` itself was compiled against hidraw.
+    if sys.platform.startswith("linux"):
+        try:
+            import hidraw as _hid
+            _HID_MODULE_NAME = "hidraw"
+        except ImportError:
+            import hid as _hid
+            _HID_MODULE_NAME = "hid"
+    else:
+        import hid as _hid
+        _HID_MODULE_NAME = "hid"
     HIDAPI_OK = True
+    HIDAPI_IMPORT_ERROR = None
     # On macOS, allow non-exclusive HID access so the mouse keeps working
     if sys.platform == "darwin" and hasattr(_hid, "hid_darwin_set_open_exclusive"):
         _hid.hid_darwin_set_open_exclusive(0)
-except ImportError:
+except Exception as exc:
     HIDAPI_OK = False
+    HIDAPI_IMPORT_ERROR = exc
 
-# Support both "pip install hidapi" (hid.device) and "pip install hid" (hid.Device)
+# Support both hidapi/hidraw-style modules (device) and "pip install hid" (Device).
 _HID_API_STYLE = None
 if HIDAPI_OK:
     if hasattr(_hid, 'device'):
         _HID_API_STYLE = "hidapi"
     elif hasattr(_hid, 'Device'):
         _HID_API_STYLE = "hid"
+
+
+_LOG_ONCE_KEYS = set()
+
+
+def _log_once(key, message):
+    if key in _LOG_ONCE_KEYS:
+        return
+    _LOG_ONCE_KEYS.add(key)
+    print(message)
+
+
+def _device_path_display(path):
+    if isinstance(path, memoryview):
+        path = bytes(path)
+    if isinstance(path, bytes):
+        return path.decode("utf-8", errors="replace")
+    return str(path or "")
+
+
+def _owner_name(uid):
+    try:
+        import pwd
+        return pwd.getpwuid(uid).pw_name
+    except Exception:
+        return str(uid)
+
+
+def _group_name(gid):
+    try:
+        import grp
+        return grp.getgrgid(gid).gr_name
+    except Exception:
+        return str(gid)
+
+
+def _format_linux_device_access(path):
+    if isinstance(path, memoryview):
+        path = bytes(path)
+    display = _device_path_display(path)
+    if not path:
+        return "path=-"
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        return f"path={display} stat_error={exc}"
+
+    mode = stat.S_IMODE(st.st_mode)
+    can_read = os.access(path, os.R_OK)
+    can_write = os.access(path, os.W_OK)
+    can_rw = os.access(path, os.R_OK | os.W_OK)
+    return (
+        f"path={display} mode={mode:04o} "
+        f"owner={_owner_name(st.st_uid)}({st.st_uid}) "
+        f"group={_group_name(st.st_gid)}({st.st_gid}) "
+        f"access=read:{can_read} write:{can_write} read_write:{can_rw}"
+    )
 
 
 class _HidDeviceCompat:
@@ -147,8 +222,6 @@ if sys.platform == "darwin":
 
 def _default_backend_preference(platform_name=None):
     platform_name = sys.platform if platform_name is None else platform_name
-    if platform_name == "darwin":
-        return "iokit"
     return "auto"
 
 
@@ -464,18 +537,84 @@ if _MAC_NATIVE_OK:
 # ── Constants ─────────────────────────────────────────────────────
 LOGI_VID       = 0x046D
 
+
+def _summarize_hid_infos(infos, limit=8):
+    parts = []
+    for info in list(infos)[:limit]:
+        pid = int(info.get("product_id", 0) or 0)
+        usage_page = int(info.get("usage_page", 0) or 0)
+        usage = int(info.get("usage", 0) or 0)
+        product = info.get("product_string") or "?"
+        transport = info.get("transport") or "-"
+        parts.append(
+            f"PID=0x{pid:04X} UP=0x{usage_page:04X} "
+            f"usage=0x{usage:04X} transport={transport} product={product}"
+        )
+    remaining = max(0, len(infos) - limit)
+    if remaining:
+        parts.append(f"... {remaining} more")
+    return "; ".join(parts) if parts else "-"
+
+
+def _linux_logitech_hidraw_nodes(base="/sys/class/hidraw"):
+    if not sys.platform.startswith("linux"):
+        return []
+    try:
+        entries = sorted(os.listdir(base))
+    except OSError:
+        return []
+
+    nodes = []
+    for entry in entries:
+        if not entry.startswith("hidraw"):
+            continue
+        uevent_path = os.path.join(base, entry, "device", "uevent")
+        try:
+            with open(uevent_path, "r", encoding="utf-8", errors="replace") as fh:
+                values = dict(
+                    line.rstrip("\n").split("=", 1)
+                    for line in fh
+                    if "=" in line
+                )
+        except OSError:
+            continue
+
+        parts = values.get("HID_ID", "").split(":")
+        if len(parts) < 3:
+            continue
+        try:
+            vid = int(parts[1], 16)
+            pid = int(parts[2], 16)
+        except ValueError:
+            continue
+        if vid != LOGI_VID:
+            continue
+
+        product = values.get("HID_NAME") or "?"
+        nodes.append(f"{entry} PID=0x{pid:04X} product={product}")
+    return nodes
+
+
 SHORT_ID       = 0x10        # HID++ short report (7 bytes total)
 LONG_ID        = 0x11        # HID++ long  report (20 bytes total)
 SHORT_LEN      = 7
 LONG_LEN       = 20
 
 BT_DEV_IDX     = 0xFF        # device-index for direct Bluetooth
+# Known Logi Bolt receiver PID.
+# Source: https://github.com/pwr-Solaar/Solaar/blob/master/lib/logitech_receiver/base_usb.py
+BOLT_RECEIVER_PID = 0xC548
 FEAT_IROOT     = 0x0000
 FEAT_REPROG_V4 = 0x1B04      # Reprogrammable Controls V4
 FEAT_ADJ_DPI   = 0x2201      # Adjustable DPI
 FEAT_SMART_SHIFT          = 0x2110  # Smart Shift basic
 FEAT_SMART_SHIFT_ENHANCED = 0x2111  # Smart Shift Enhanced (MX Master 3/3S, MX Master 4)
+FEAT_HIRES_WHEEL          = 0x2120
+FEAT_HIRES_WHEEL_ENHANCED = 0x2121
+FEAT_LOWRES_WHEEL         = 0x2130
+FEAT_THUMB_WHEEL          = 0x2150
 FEAT_UNIFIED_BATT   = 0x1004      # Unified Battery (preferred)
+FEAT_DEVICE_NAME    = 0x0005      # Device Name & Type
 FEAT_BATTERY_STATUS = 0x1000      # Battery Status (fallback)
 FEAT_HAPTIC         = 0x19B0      # Haptic Feedback (MX Master 4)
 FEAT_FORCE_SENSING  = 0x19C0      # Force Sensing Button (MX Master 4)
@@ -601,8 +740,12 @@ class HidGestureListener:
         self._dpi_result  = None        # True/False after apply
         self._smart_shift_idx = None      # feature index of SMART_SHIFT / SMART_SHIFT_ENHANCED
         self._smart_shift_enhanced = False  # True → use fn 1/2; False → fn 0/1
+        self._wheel_feature_indexes = {}
         self._pending_smart_shift = None
         self._smart_shift_result = None
+        self._smart_shift_call_lock = threading.Lock()
+        self._smart_shift_slot_lock = threading.Lock()
+        self._smart_shift_event = threading.Event()
         self._reconnect_requested = False
         self._pending_battery = None
         self._battery_result = None
@@ -620,10 +763,21 @@ class HidGestureListener:
 
     def start(self):
         if not HIDAPI_OK and not _MAC_NATIVE_OK:
-            print("[HidGesture] no HID backend available; install hidapi")
+            details = f": {HIDAPI_IMPORT_ERROR!r}" if HIDAPI_IMPORT_ERROR else ""
+            print(f"[HidGesture] no HID backend available; install hidapi{details}")
             return False
         if not HIDAPI_OK and _MAC_NATIVE_OK:
             print("[HidGesture] hidapi unavailable; using native macOS HID backend only")
+        if HIDAPI_OK:
+            print(
+                "[HidGesture] HID module: "
+                f"{_HID_MODULE_NAME or '?'} API style: {_HID_API_STYLE or '?'}"
+            )
+            if sys.platform.startswith("linux") and _HID_MODULE_NAME != "hidraw":
+                print(
+                    "[HidGesture] Linux hidraw module is unavailable; Bluetooth "
+                    "Logitech HID++ devices may not enumerate"
+                )
         self._running = True
         self._thread = threading.Thread(
             target=self._main_loop, daemon=True, name="HidGesture")
@@ -646,6 +800,47 @@ class HidGestureListener:
     @property
     def connected_device(self):
         return self._connected_device_info
+
+    def _discovered_feature_ids(self):
+        feature_ids = []
+        if self._feat_idx is not None:
+            feature_ids.append(FEAT_REPROG_V4)
+        if self._dpi_idx is not None:
+            feature_ids.append(FEAT_ADJ_DPI)
+        if self._smart_shift_idx is not None:
+            feature_ids.append(
+                FEAT_SMART_SHIFT_ENHANCED
+                if self._smart_shift_enhanced
+                else FEAT_SMART_SHIFT
+            )
+        if self._battery_idx is not None and self._battery_feature_id is not None:
+            feature_ids.append(self._battery_feature_id)
+        feature_ids.extend(sorted(self._wheel_feature_indexes))
+        return tuple(feature_ids)
+
+    def _discovered_feature_inventory(self):
+        features = []
+        if self._feat_idx is not None:
+            features.append({"feature_id": FEAT_REPROG_V4, "index": self._feat_idx})
+        if self._dpi_idx is not None:
+            features.append({"feature_id": FEAT_ADJ_DPI, "index": self._dpi_idx})
+        if self._smart_shift_idx is not None:
+            features.append({
+                "feature_id": (
+                    FEAT_SMART_SHIFT_ENHANCED
+                    if self._smart_shift_enhanced
+                    else FEAT_SMART_SHIFT
+                ),
+                "index": self._smart_shift_idx,
+            })
+        if self._battery_idx is not None and self._battery_feature_id is not None:
+            features.append({
+                "feature_id": self._battery_feature_id,
+                "index": self._battery_idx,
+            })
+        for feature_id, index in sorted(self._wheel_feature_indexes.items()):
+            features.append({"feature_id": feature_id, "index": index})
+        return tuple(features)
 
     def dump_device_info(self):
         """Return a dict describing everything we know about the connected device.
@@ -675,6 +870,8 @@ class HidGestureListener:
             features["HAPTIC (0x19B0)"] = f"index 0x{self._haptic_idx:02X}"
         if self._force_sensing_idx is not None:
             features["FORCE_SENSING (0x19C0)"] = f"index 0x{self._force_sensing_idx:02X}"
+        for feature_id, index in sorted(self._wheel_feature_indexes.items()):
+            features[f"WHEEL (0x{feature_id:04X})"] = f"index 0x{index:02X}"
 
         controls = []
         for c in self._last_controls:
@@ -683,6 +880,9 @@ class HidGestureListener:
                 "cid": f"0x{c['cid']:04X}",
                 "task": f"0x{c['task']:04X}",
                 "flags": f"0x{c['flags']:04X}",
+                "position": c.get("pos"),
+                "group": c.get("group"),
+                "group_mask": f"0x{c.get('gmask', 0):02X}",
                 "mapped_to": f"0x{c['mapped_to']:04X}",
                 "mapping_flags": f"0x{c['mapping_flags']:04X}",
             })
@@ -700,6 +900,7 @@ class HidGestureListener:
             "discovered_features": features,
             "reprog_controls": controls,
             "gesture_candidates": [f"0x{c:04X}" for c in self._gesture_candidates],
+            "capability_inventory": dev.capability_inventory.to_dict(),
         }
 
     # ── device discovery ──────────────────────────────────────────
@@ -726,9 +927,60 @@ class HidGestureListener:
 
         if HIDAPI_OK and _BACKEND_PREFERENCE in ("auto", "hidapi"):
             try:
-                for info in _hid.enumerate(LOGI_VID, 0):
-                    if info.get("usage_page", 0) >= 0xFF00:
+                raw_infos = list(_hid.enumerate(LOGI_VID, 0))
+                if not raw_infos:
+                    _log_once(
+                        f"hidapi-empty-{_HID_MODULE_NAME}",
+                        "[HidGesture] "
+                        f"{_HID_MODULE_NAME or 'hidapi'} enumerate(0x{LOGI_VID:04X}) "
+                        "returned no Logitech HID interfaces"
+                    )
+                    linux_nodes = _linux_logitech_hidraw_nodes()
+                    if linux_nodes:
+                        _log_once(
+                            "linux-hidraw-logitech-present",
+                            "[HidGesture] Linux sysfs sees Logitech hidraw nodes: "
+                            f"{'; '.join(linux_nodes[:8])}. If hidapi still sees "
+                            "none, check hidraw backend packaging and /dev/hidraw "
+                            "permissions."
+                        )
+                    elif sys.platform.startswith("linux"):
+                        _log_once(
+                            "linux-hidraw-logitech-missing",
+                            "[HidGesture] Linux sysfs sees no Logitech hidraw "
+                            "nodes for VID 0x046D; verify the mouse is connected "
+                            "as an active HID device, not only paired."
+                        )
+                hidapi_candidates = 0
+                fallback_candidates = 0
+                for info in raw_infos:
+                    pid = int(info.get("product_id", 0) or 0)
+                    usage_page = int(info.get("usage_page", 0) or 0)
+                    usage = int(info.get("usage", 0) or 0)
+                    product = info.get("product_string")
+                    if usage_page >= 0xFF00:
                         add_info(dict(info, source="hidapi-enumerate"))
+                        hidapi_candidates += 1
+                        continue
+                    if resolve_device(product_id=pid, product_name=product):
+                        print(
+                            "[HidGesture] Accepting known Logitech device "
+                            "without vendor usage metadata for fallback probe "
+                            f"PID=0x{pid:04X} UP=0x{usage_page:04X} "
+                            f"usage=0x{usage:04X} product={product or '?'}"
+                        )
+                        add_info(dict(info, source="hidapi-enumerate-fallback"))
+                        fallback_candidates += 1
+                if raw_infos and not (hidapi_candidates or fallback_candidates):
+                    print(
+                        "[HidGesture] hidapi found Logitech interfaces, but none "
+                        "matched vendor usage metadata or known-device fallback"
+                    )
+                    _log_once(
+                        f"hidapi-filtered-{_HID_MODULE_NAME}",
+                        "[HidGesture] Filtered Logitech HID interfaces: "
+                        f"{_summarize_hid_infos(raw_infos)}"
+                    )
             except Exception as exc:
                 print(f"[HidGesture] hidapi enumerate error: {exc}")
 
@@ -775,6 +1027,11 @@ class HidGestureListener:
         except Exception as exc:
             print(f"[HidGesture] request tx failed feat=0x{feat:02X} func=0x{func:X} "
                   f"params=[{_hex_bytes(req_params)}]: {exc}")
+            # Discovery probes should skip bad candidates, but an active session
+            # transport failure means the live handle has died and the main loop
+            # must run its existing cleanup/reconnect path.
+            if self._connected:
+                raise IOError(str(exc)) from exc
             return None
         deadline = time.time() + timeout_ms / 1000
         while time.time() < deadline:
@@ -783,6 +1040,8 @@ class HidGestureListener:
             except Exception as exc:
                 print(f"[HidGesture] request rx failed feat=0x{feat:02X} func=0x{func:X} "
                       f"params=[{_hex_bytes(req_params)}]: {exc}")
+                if self._connected:
+                    raise IOError(str(exc)) from exc
                 return None
             if raw is None:
                 continue
@@ -826,6 +1085,35 @@ class HidGestureListener:
             if p and p[0] != 0:
                 return p[0]
         return None
+
+    def _query_device_name(self):
+        """Query device name via HID++ feature 0x0005 (DEVICE_NAME_TYPE)."""
+        name_idx = self._find_feature(FEAT_DEVICE_NAME)
+        if name_idx is None:
+            return None
+        resp = self._request(name_idx, 0, [0x00] * 3)
+        if not resp:
+            return None
+        _, _, _, _, params = resp
+        name_len = params[0]
+        if name_len == 0:
+            return None
+        name_bytes = []
+        offset = 0
+        while offset < name_len:
+            resp = self._request(name_idx, 1, [offset, 0x00, 0x00])
+            if not resp:
+                break
+            _, _, _, _, chunk = resp
+            remaining = name_len - offset
+            name_bytes.extend(chunk[:remaining])
+            offset += len(chunk)
+            if len(chunk) == 0:
+                break
+        if not name_bytes:
+            return None
+        name = bytes(name_bytes).decode("ascii", errors="replace").strip("\x00").strip()
+        return name if name else None
 
     def _get_cid_reporting(self, cid):
         if self._feat_idx is None:
@@ -1094,23 +1382,31 @@ class HidGestureListener:
         smart_shift_enabled: True to enable auto SmartShift (auto-switching)
         threshold: 1-50 sensitivity when SmartShift is enabled
         Can be called from any thread.  Returns True on success."""
-        self._smart_shift_result = None
-        self._pending_smart_shift = (mode, smart_shift_enabled, threshold)
-        for _ in range(30):
-            if self._pending_smart_shift is None:
+        pending = (mode, smart_shift_enabled, threshold)
+        with self._smart_shift_call_lock:
+            with self._smart_shift_slot_lock:
+                self._smart_shift_result = None
+                self._pending_smart_shift = pending
+                self._smart_shift_event.clear()
+            if not self._smart_shift_event.wait(3):
+                with self._smart_shift_slot_lock:
+                    if self._pending_smart_shift == pending:
+                        self._smart_shift_result = False
+                        self._pending_smart_shift = None
+                        self._smart_shift_event.set()
+                print("[HidGesture] Smart Shift set timed out")
+                return False
+            with self._smart_shift_slot_lock:
                 return self._smart_shift_result is True
-            time.sleep(0.1)
-        print("[HidGesture] Smart Shift set timed out")
-        return False
 
     def _apply_pending_smart_shift(self):
-        pending = self._pending_smart_shift
+        with self._smart_shift_slot_lock:
+            pending = self._pending_smart_shift
         if pending is None:
             return
         if self._smart_shift_idx is None or self._dev is None:
             print("[HidGesture] Cannot set Smart Shift — not connected")
-            self._smart_shift_result = None if pending == "read" else False
-            self._pending_smart_shift = None
+            self._finish_pending_smart_shift(None if pending == "read" else False)
             return
         if pending == "read":
             self._apply_pending_read_smart_shift()
@@ -1140,11 +1436,11 @@ class HidGestureListener:
             label = "fixed ratchet (SmartShift disabled)"
         if resp:
             print(f"[HidGesture] Smart Shift set to {label}")
-            self._smart_shift_result = True
+            result = True
         else:
             print("[HidGesture] Smart Shift set FAILED")
-            self._smart_shift_result = False
-        self._pending_smart_shift = None
+            result = False
+        self._finish_pending_smart_shift(result)
 
     def force_reconnect(self):
         """Request the listener thread to drop and re-establish the HID++ connection.
@@ -1158,20 +1454,41 @@ class HidGestureListener:
     def read_smart_shift(self):
         """Queue a Smart Shift read.
         Returns dict {'mode': str, 'enabled': bool, 'threshold': int} or None."""
-        self._smart_shift_result = None
-        self._pending_smart_shift = "read"
-        for _ in range(30):
-            if self._pending_smart_shift is None:
+        with self._smart_shift_call_lock:
+            with self._smart_shift_slot_lock:
+                self._smart_shift_result = None
+                self._pending_smart_shift = "read"
+                self._smart_shift_event.clear()
+            if not self._smart_shift_event.wait(3):
+                with self._smart_shift_slot_lock:
+                    if self._pending_smart_shift == "read":
+                        self._smart_shift_result = None
+                        self._pending_smart_shift = None
+                        self._smart_shift_event.set()
+                print("[HidGesture] Smart Shift read timed out")
+                return None
+            with self._smart_shift_slot_lock:
                 return self._smart_shift_result
-            time.sleep(0.1)
-        print("[HidGesture] Smart Shift read timed out")
-        self._pending_smart_shift = None   # prevent stale processing
-        return None
+
+    def _finish_pending_smart_shift(self, result):
+        with self._smart_shift_slot_lock:
+            self._smart_shift_result = result
+            self._pending_smart_shift = None
+            self._smart_shift_event.set()
+
+    def _abort_pending_smart_shift(self):
+        with self._smart_shift_slot_lock:
+            pending = self._pending_smart_shift
+            if pending is None:
+                self._smart_shift_result = None
+                return
+            self._smart_shift_result = None if pending == "read" else False
+            self._pending_smart_shift = None
+            self._smart_shift_event.set()
 
     def _apply_pending_read_smart_shift(self):
         if self._smart_shift_idx is None or self._dev is None:
-            self._smart_shift_result = None
-            self._pending_smart_shift = None
+            self._finish_pending_smart_shift(None)
             return
         # enhanced (0x2111): read fn=1; basic (0x2110): read fn=0
         read_fn = 1 if self._smart_shift_enhanced else 0
@@ -1194,11 +1511,10 @@ class HidGestureListener:
             else:
                 result = {"mode": "ratchet", "enabled": False, "threshold": 25}
             print(f"[HidGesture] Smart Shift state = {result}")
-            self._smart_shift_result = result
+            self._finish_pending_smart_shift(result)
         else:
             print("[HidGesture] Smart Shift read FAILED")
-            self._smart_shift_result = None
-        self._pending_smart_shift = None
+            self._finish_pending_smart_shift(None)
 
     # ── Haptic Feedback control (0x19B0) ─────────────────────────
     #
@@ -1524,6 +1840,14 @@ class HidGestureListener:
         if not infos:
             return False
 
+        # Try direct devices (Bluetooth) before USB receivers, which
+        # require scanning multiple slots with slow timeouts.
+        def _direct_device_first(info):
+            name = (info.get("product_string") or "").lower()
+            return (1 if "receiver" in name else 0, name)
+
+        infos.sort(key=_direct_device_first)
+
         print(f"[HidGesture] Backend preference: {_BACKEND_PREFERENCE}")
         print(f"[HidGesture] Candidate HID interfaces: {len(infos)}")
         for info in infos:
@@ -1533,9 +1857,10 @@ class HidGestureListener:
             transport = info.get("transport")
             source = info.get("source", "unknown")
             product = info.get("product_string") or "?"
+            path = _device_path_display(info.get("path"))
             print(f"[HidGesture] Candidate PID=0x{pid:04X} UP=0x{up:04X} "
                   f"usage=0x{usage:04X} transport={transport or '-'} "
-                  f"source={source} product={product}")
+                  f"source={source} product={product} path={path or '-'}")
 
         for info in infos:
             pid = info.get("product_id", 0)
@@ -1552,6 +1877,7 @@ class HidGestureListener:
             self._haptic_idx = None
             self._force_sensing_idx = None
             self._haptic_capabilities = None
+            self._wheel_feature_indexes = {}
             self._gesture_cid = DEFAULT_GESTURE_CID
             self._gesture_candidates = list(
                 getattr(device_spec, "gesture_cids", ()) or DEFAULT_GESTURE_CIDS
@@ -1560,9 +1886,10 @@ class HidGestureListener:
             opened_transport = None
             opened_up = int(up or 0)
             opened_usage = int(usage or 0)
+            opened_path = ""
             open_attempts = []
-            if _BACKEND_PREFERENCE in ("auto", "hidapi") and info.get("path"):
-                open_attempts.append(("hidapi", info))
+            # On macOS, prefer IOKit (non-exclusive access) over hidapi
+            # which may lock the device and freeze the cursor.
             if (
                 sys.platform == "darwin"
                 and _MAC_NATIVE_OK
@@ -1577,6 +1904,8 @@ class HidGestureListener:
                         "transport": "Bluetooth Low Energy",
                     }),
                 ])
+            if _BACKEND_PREFERENCE in ("auto", "hidapi") and info.get("path"):
+                open_attempts.append(("hidapi", info))
 
             for transport, open_info in open_attempts:
                 try:
@@ -1591,6 +1920,13 @@ class HidGestureListener:
                     else:
                         if not HIDAPI_OK:
                             continue
+                        if sys.platform.startswith("linux"):
+                            path = open_info.get("path")
+                            _log_once(
+                                ("hid-path-access", _device_path_display(path)),
+                                "[HidGesture] HID path access before open: "
+                                f"{_format_linux_device_access(path)}",
+                            )
                         if _HID_API_STYLE == "hidapi":
                             d = _hid.device()
                             d.open_path(open_info["path"])
@@ -1601,6 +1937,7 @@ class HidGestureListener:
                     opened_transport = open_info.get("transport") or transport
                     opened_up = int(open_info.get("usage_page", up) or 0)
                     opened_usage = int(open_info.get("usage", usage) or 0)
+                    opened_path = _device_path_display(open_info.get("path"))
                     print(f"[HidGesture] Opened PID=0x{pid:04X} via {transport}")
                     break
                 except Exception as exc:
@@ -1614,6 +1951,7 @@ class HidGestureListener:
 
             # Try Bluetooth direct (0xFF) first, then Bolt receiver slots
             reprog_found = False
+            hidpp_name = None
             for idx in (0xFF, 1, 2, 3, 4, 5, 6):
                 self._dev_idx = idx
                 fi = self._find_feature(FEAT_REPROG_V4)
@@ -1622,6 +1960,18 @@ class HidGestureListener:
                     self._feat_idx = fi
                     print(f"[HidGesture] Found REPROG_V4 @0x{fi:02X}  "
                           f"PID=0x{pid:04X} devIdx=0x{idx:02X}")
+                    # Query actual device name via HID++ (resolves
+                    # USB receivers that report a generic PID/name).
+                    hidpp_name = self._query_device_name()
+                    if hidpp_name:
+                        print(f"[HidGesture] HID++ device name: '{hidpp_name}'")
+                        device_spec = resolve_device(
+                            product_id=pid, product_name=hidpp_name,
+                        ) or device_spec
+                        self._gesture_candidates = list(
+                            getattr(device_spec, "gesture_cids", ())
+                            or DEFAULT_GESTURE_CIDS
+                        )
                     controls = self._discover_reprog_controls()
                     self._last_controls = controls
                     self._gesture_candidates = self._choose_gesture_candidates(
@@ -1648,6 +1998,19 @@ class HidGestureListener:
                             self._smart_shift_idx = ss_fi
                             self._smart_shift_enhanced = False
                             print(f"[HidGesture] Found SMART_SHIFT (basic) @0x{ss_fi:02X}")
+                    for wheel_feature in (
+                        FEAT_HIRES_WHEEL,
+                        FEAT_HIRES_WHEEL_ENHANCED,
+                        FEAT_LOWRES_WHEEL,
+                        FEAT_THUMB_WHEEL,
+                    ):
+                        wheel_fi = self._find_feature(wheel_feature)
+                        if wheel_fi:
+                            self._wheel_feature_indexes[wheel_feature] = wheel_fi
+                            print(
+                                f"[HidGesture] Found wheel feature "
+                                f"0x{wheel_feature:04X} @0x{wheel_fi:02X}"
+                            )
                     batt_fi = self._find_feature(FEAT_UNIFIED_BATT)
                     if batt_fi:
                         self._battery_idx = batt_fi
@@ -1682,15 +2045,33 @@ class HidGestureListener:
                               f"(detected but not configurable)")
                     if self._divert():
                         self._divert_extras()
+                        if idx == BT_DEV_IDX:
+                            actual_transport = "Bluetooth"
+                        elif pid == BOLT_RECEIVER_PID:
+                            actual_transport = "Logi Bolt"
+                        else:
+                            actual_transport = "USB Receiver"
                         self._connected_device_info = build_connected_device_info(
                             product_id=pid,
-                            product_name=product,
-                            transport=open_info.get("transport") or transport,
+                            product_name=hidpp_name or product,
+                            transport=actual_transport,
                             source=source,
                             gesture_cids=self._gesture_candidates,
+                            reprog_controls=controls,
+                            active_gesture_cid=self._gesture_cid,
+                            gesture_rawxy_enabled=self._rawxy_enabled,
+                            discovered_features=self._discovered_feature_inventory(),
+                            device_identity={
+                                "device_index": self._dev_idx,
+                                "usage_page": opened_up,
+                                "usage": opened_usage,
+                                "backend": transport,
+                                "hid_module": _HID_MODULE_NAME or "",
+                                "device_path": opened_path,
+                            },
                         )
                         return True
-                    break        # right device but divert failed
+                    continue     # divert failed — try next receiver slot
             if not reprog_found:
                 print(
                     "[HidGesture] Opened candidate but REPROG_V4 was not found "
@@ -1784,9 +2165,11 @@ class HidGestureListener:
             self._smart_shift_idx = None
             self._battery_idx = None
             self._battery_feature_id = None
+            self._wheel_feature_indexes = {}
             self._pending_battery = None
             self._pending_dpi = None
-            self._pending_smart_shift = None
+            self._dpi_result = None
+            self._abort_pending_smart_shift()
             self._last_logged_battery = None
             self._consecutive_request_timeouts = 0
             self._haptic_idx = None

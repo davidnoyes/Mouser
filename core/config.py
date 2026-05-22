@@ -69,7 +69,7 @@ BUTTON_TO_EVENTS = {
 }
 
 DEFAULT_CONFIG = {
-    "version": 10,
+    "version": 13,
     "active_profile": "default",
     "profiles": {
         "default": {
@@ -115,6 +115,9 @@ DEFAULT_CONFIG = {
         "action_haptic": [],        # action IDs that fire haptic on press; empty = opt-in
         "button_haptic": [],        # button keys that fire haptic on press; empty = opt-in
         "haptic_dedup": True,       # True = deduplicate pulses within 100ms window
+        "ignore_trackpad": True,
+        "check_for_updates": True,
+        "update_check_state": {},
     },
 }
 
@@ -387,12 +390,13 @@ def _migrate(cfg):
 
     if version < 9:
         # v8 -> v9: add Actions Ring button mapping for MX Master 4,
-        # add haptic feedback level setting.
+        # add haptic feedback level setting, and add ignore_trackpad setting.
         for pdata in cfg.get("profiles", {}).values():
             mappings = pdata.setdefault("mappings", {})
             mappings.setdefault("actions_ring", "none")
         settings = cfg.setdefault("settings", {})
         settings.setdefault("haptic_level", 2)
+        settings.setdefault("ignore_trackpad", True)
         cfg["version"] = 9
 
     if version < 10:
@@ -423,6 +427,9 @@ def _migrate(cfg):
     cfg["settings"].setdefault("debug_mode", False)
     cfg["settings"].setdefault("device_layout_overrides", {})
     cfg["settings"].setdefault("language", "en")
+    cfg["settings"].setdefault("ignore_trackpad", True)
+    cfg["settings"].setdefault("check_for_updates", True)
+    cfg["settings"].setdefault("update_check_state", {})
 
     # Always migrate old wmplayer.exe → Microsoft.Media.Player.exe in profile apps
     for pdata in cfg.get("profiles", {}).values():

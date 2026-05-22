@@ -6,7 +6,8 @@ Mouser now supports macOS alongside Windows. This document covers macOS-specific
 
 - **macOS 12 (Monterey)** or later recommended
 - **Python 3.11+** (via Homebrew or python.org)
-- **Apple Silicon / M1**: use an `arm64` Python interpreter if you want a native `arm64` app bundle
+- **Apple Silicon / M1+**: use an `arm64` Python interpreter if you want a native Apple Silicon app bundle
+- **Intel Macs**: use an `x86_64` Python interpreter if you want a native Intel app bundle
 - **Accessibility permission** — required for CGEventTap to intercept mouse events
 
 ### Python Dependencies
@@ -70,6 +71,12 @@ Desktop/navigation actions are also remapped to native macOS behavior:
 On macOS, the HID gesture listener uses non-exclusive access (`hid_darwin_set_open_exclusive(0)`)
 so the mouse continues to function normally while Mouser reads HID++ reports.
 
+### Trackpad and Magic Mouse Scroll
+
+Mouser ignores trackpad and Magic Mouse continuous scroll events by default so two-finger gestures and macOS natural scrolling keep working normally while mouse wheel mappings stay active.
+
+You can change this in **Point & Scroll → Scroll Direction → Ignore trackpad**. Leave it enabled for built-in trackpads and most Logitech mouse setups. Disable it only if you intentionally want Mouser to handle Magic Mouse or trackpad scroll events.
+
 ## Building a Native macOS App
 
 The repository now includes a dedicated macOS bundle flow:
@@ -87,10 +94,14 @@ dist/Mouser.app
 
 Notes:
 
-- Build on the target architecture. On an M1/M2/M3 Mac, use an `arm64` Python to produce an Apple Silicon app.
-- The build flow uses the committed `images/AppIcon.icns` when present; otherwise the script generates an `.icns` icon from `images/logo_icon.png`, runs PyInstaller with `Mouser-mac.spec`, and applies ad-hoc signing via `codesign --sign -`.
+- Build on the target architecture. On an M1/M2/M3 Mac, use an `arm64` Python to produce an Apple Silicon app; on an Intel Mac, use an `x86_64` Python to produce an Intel app.
+- You can also set `PYINSTALLER_TARGET_ARCH=arm64` or `PYINSTALLER_TARGET_ARCH=x86_64` before running `./build_macos_app.sh` when your macOS Python environment supports that target.
+- The build flow uses the committed `images/AppIcon.icns` when present; otherwise the script generates an `.icns` icon from `images/logo_icon.png`, then runs PyInstaller with `Mouser-mac.spec`.
+- Signing path depends on `MOUSER_SIGN_IDENTITY`. Unset: the bundle is ad-hoc signed (`codesign --sign -`), which is fine for one-off builds but can rotate the code identity on every rebuild, so macOS Accessibility grants may reset. Set to a codesigning identity (list with `security find-identity -v -p codesigning`, SHA-1 form preferred): the script signs nested `.dylib` / `.so` / `.framework` files depth-first with `--options runtime`, then signs the outer bundle with `build_resources/Mouser.entitlements`, then runs `codesign --verify --deep --strict` and aborts the build if it fails. Stable permission behavior depends on unchanged source, resolved Python interpreter, dependencies, architecture, signing identity, entitlements, and timestamp policy.
+- This signed path is for local repeated developer builds. It is not a notarized release-signing workflow; public macOS release zips remain ad-hoc signed until a separate Developer ID signing, secure timestamp, notarization, stapling, and Gatekeeper assessment workflow exists.
 - The app can then be moved to `/Applications/Mouser.app` and launched directly from Finder, Spotlight, or Dock.
 - `pyinstaller Mouser.spec` remains available as a simpler cross-platform build path, but the dedicated macOS script is the preferred bundle flow.
+- Release builds publish `Mouser-macOS.zip` for Apple Silicon and `Mouser-macOS-intel.zip` for Intel Macs.
 
 The packaged app runs as an `LSUIElement`, so it lives in the menu bar instead of showing a Dock icon.
 

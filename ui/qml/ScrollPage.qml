@@ -11,6 +11,43 @@ Item {
     // Reactive shortcut — all s["key"] bindings update when lm.languageChanged fires
     property var s: lm.strings
 
+    function updateStatusText() {
+        if (backend.updateInstallStatus === "checking")
+            return s["scroll.update_checking"]
+        if (backend.updateInstallStatus === "downloading")
+            return s["scroll.update_downloading"]
+        if (backend.updateInstallStatus === "verifying")
+            return s["scroll.update_verifying"]
+        if (backend.updateInstallStatus === "ready_to_install")
+            return s["scroll.update_ready"]
+        if (backend.updateInstallStatus === "installing")
+            return s["scroll.update_installing"]
+        if (backend.updateInstallStatus === "installed")
+            return backend.updateInstallMessage ? s["scroll.update_installed_version"].replace("%1", backend.updateInstallMessage) : s["scroll.update_installed"]
+        if (backend.updateInstallStatus === "cancelled")
+            return s["scroll.update_cancelled"]
+        if (backend.updateInstallStatus === "manual_fallback") {
+            if (backend.updateInstallMessage === "macos")
+                return s["scroll.update_manual_macos"]
+            if (backend.updateInstallMessage === "linux")
+                return s["scroll.update_manual_linux"]
+            if (backend.updateInstallMessage === "windows")
+                return s["scroll.update_manual_windows"]
+            if (backend.updateInstallMessage === "no_asset")
+                return s["scroll.update_no_asset"]
+            return s["scroll.update_manual"]
+        }
+        if (backend.updateInstallStatus === "error") {
+            var key = "scroll.update_error_" + backend.updateInstallMessage
+            if (s[key])
+                return s[key]
+            return s["scroll.update_error"]
+        }
+        if (backend.latestUpdateVersion)
+            return s["scroll.update_available"].replace("%1", backend.latestUpdateVersion)
+        return s["scroll.update_idle"]
+    }
+
     readonly property var appearanceOptions: [
         { label: s["scroll.system"], value: "system" },
         { label: s["scroll.light"],  value: "light"  },
@@ -140,15 +177,16 @@ Item {
                             color: scrollPage.theme.textDim
                         }
 
-                        Slider {
+                        WheelSafeSlider {
                             id: dpiSlider
                             Layout.fillWidth: true
                             from: backend.deviceDpiMin
                             to: backend.deviceDpiMax
                             stepSize: 50
                             value: backend.dpi
-                            Material.accent: scrollPage.theme.accent
-                            Accessible.name: s["scroll.pointer_speed"]
+                            accentColor: scrollPage.theme.accent
+                            accentDimColor: scrollPage.theme.accentDim
+                            trackColor: scrollPage.theme.border
 
                             onMoved: {
                                 dpiLabel.text = Math.round(value) + " DPI"
@@ -310,9 +348,10 @@ Item {
                         Switch {
                             id: smartShiftToggle
                             checked: backend.smartShiftEnabled
+                            focusPolicy: Qt.StrongFocus
                             Material.accent: scrollPage.theme.accent
                             Accessible.name: "SmartShift"
-                            onToggled: backend.setSmartShiftEnabled(checked)
+                            onClicked: backend.setSmartShiftEnabled(checked)
                         }
                     }
 
@@ -343,15 +382,16 @@ Item {
                                 color: scrollPage.theme.textDim
                             }
 
-                            Slider {
+                            WheelSafeSlider {
                                 id: smartShiftSlider
                                 Layout.fillWidth: true
                                 from: 1
                                 to: 50
                                 stepSize: 1
                                 value: backend.smartShiftThreshold
-                                Material.accent: scrollPage.theme.accent
-                                Accessible.name: "SmartShift sensitivity"
+                                accentColor: scrollPage.theme.accent
+                                accentDimColor: scrollPage.theme.accentDim
+                                trackColor: scrollPage.theme.border
 
                                 onMoved: {
                                     smartShiftLabel.text = Math.round(value * 2) + "%"
@@ -716,9 +756,10 @@ Item {
                             Switch {
                                 id: startAtLoginSwitch
                                 checked: backend.startAtLogin
+                                focusPolicy: Qt.StrongFocus
                                 Material.accent: scrollPage.theme.accent
                                 Accessible.name: s["scroll.start_at_login"]
-                                onToggled: backend.setStartAtLogin(checked)
+                                onClicked: backend.setStartAtLogin(checked)
                             }
                         }
                     }
@@ -749,9 +790,128 @@ Item {
                             Switch {
                                 id: startMinimizedSwitch
                                 checked: backend.startMinimized
+                                focusPolicy: Qt.StrongFocus
                                 Material.accent: scrollPage.theme.accent
                                 Accessible.name: s["scroll.start_minimized"]
-                                onToggled: backend.setStartMinimized(checked)
+                                onClicked: backend.setStartMinimized(checked)
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: parent.width
+                        height: 118
+                        radius: 10
+                        color: scrollPage.theme.bgSubtle
+
+                        ColumnLayout {
+                            anchors {
+                                fill: parent
+                                leftMargin: 16
+                                rightMargin: 16
+                                topMargin: 10
+                                bottomMargin: 10
+                            }
+                            spacing: 12
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 12
+
+                                Column {
+                                    Layout.fillWidth: true
+                                    spacing: 3
+
+                                    Text {
+                                        text: s["scroll.check_for_updates"]
+                                        font {
+                                            family: uiState.fontFamily
+                                            pixelSize: 13
+                                        }
+                                        color: scrollPage.theme.textPrimary
+                                    }
+
+                                    Text {
+                                        width: parent.width
+                                        text: s["scroll.check_for_updates_desc"]
+                                        font {
+                                            family: uiState.fontFamily
+                                            pixelSize: 11
+                                        }
+                                        color: scrollPage.theme.textSecondary
+                                        wrapMode: Text.WordWrap
+                                    }
+                                }
+
+                                Switch {
+                                    id: checkUpdatesSwitch
+                                    checked: backend.checkForUpdates
+                                    focusPolicy: Qt.StrongFocus
+                                    Material.accent: scrollPage.theme.accent
+                                    Accessible.name: s["scroll.check_for_updates"]
+                                    onClicked: backend.setCheckForUpdates(checked)
+                                }
+                            }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 8
+
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: scrollPage.updateStatusText()
+                                    font {
+                                        family: uiState.fontFamily
+                                        pixelSize: 11
+                                    }
+                                    color: scrollPage.theme.textSecondary
+                                    elide: Text.ElideRight
+                                }
+
+                                ProgressBar {
+                                    Layout.preferredWidth: 120
+                                    visible: backend.updateInstallStatus === "downloading"
+                                    from: 0
+                                    to: 100
+                                    value: backend.updateInstallProgress
+                                }
+
+                                Button {
+                                    text: s["scroll.update_check"]
+                                    enabled: !backend.updateInstallInProgress
+                                    onClicked: backend.manualCheckForUpdates()
+                                }
+
+                                Button {
+                                    text: backend.isWindows ? s["scroll.update_download"] : s["scroll.update_verify"]
+                                    visible: backend.latestUpdateVersion !== ""
+                                             && !backend.updateInstallCanInstall
+                                             && (!backend.isWindows || backend.updateInstallEnabled)
+                                    enabled: !backend.updateInstallInProgress
+                                    onClicked: backend.prepareLatestUpdate()
+                                }
+
+                                Button {
+                                    text: s["scroll.update_cancel"]
+                                    visible: backend.updateInstallStatus === "checking"
+                                             || backend.updateInstallStatus === "downloading"
+                                             || backend.updateInstallStatus === "verifying"
+                                    onClicked: backend.cancelUpdatePreparation()
+                                }
+
+                                Button {
+                                    text: s["scroll.update_install"]
+                                    visible: backend.updateInstallCanInstall && backend.updateInstallEnabled
+                                    enabled: !backend.updateInstallInProgress
+                                    onClicked: backend.installPreparedUpdate()
+                                }
+
+                                Button {
+                                    text: s["scroll.update_open_release"]
+                                    visible: backend.latestUpdateVersion !== ""
+                                    enabled: !backend.updateInstallInProgress
+                                    onClicked: backend.openLatestReleasePage()
+                                }
                             }
                         }
                     }
@@ -828,9 +988,10 @@ Item {
                             Switch {
                                 id: vscrollSwitch
                                 checked: backend.invertVScroll
+                                focusPolicy: Qt.StrongFocus
                                 Material.accent: scrollPage.theme.accent
                                 Accessible.name: s["scroll.invert_vertical"]
-                                onToggled: backend.setInvertVScroll(checked)
+                                onClicked: backend.setInvertVScroll(checked)
                             }
                         }
                     }
@@ -861,9 +1022,60 @@ Item {
                             Switch {
                                 id: hscrollSwitch
                                 checked: backend.invertHScroll
+                                focusPolicy: Qt.StrongFocus
                                 Material.accent: scrollPage.theme.accent
                                 Accessible.name: s["scroll.invert_horizontal"]
-                                onToggled: backend.setInvertHScroll(checked)
+                                onClicked: backend.setInvertHScroll(checked)
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: parent.width
+                        height: 62
+                        radius: 10
+                        color: scrollPage.theme.bgSubtle
+                        visible: backend.isMacOS
+
+                        RowLayout {
+                            anchors {
+                                fill: parent
+                                leftMargin: 16
+                                rightMargin: 16
+                            }
+                            spacing: 12
+
+                            Column {
+                                Layout.fillWidth: true
+                                spacing: 3
+
+                                Text {
+                                    text: s["scroll.ignore_trackpad"]
+                                    font {
+                                        family: uiState.fontFamily
+                                        pixelSize: 13
+                                    }
+                                    color: scrollPage.theme.textPrimary
+                                }
+
+                                Text {
+                                    width: parent.width
+                                    text: s["scroll.ignore_trackpad_desc"]
+                                    font {
+                                        family: uiState.fontFamily
+                                        pixelSize: 11
+                                    }
+                                    color: scrollPage.theme.textSecondary
+                                    wrapMode: Text.WordWrap
+                                }
+                            }
+
+                            Switch {
+                                id: ignoreTrackpadSwitch
+                                checked: backend.ignoreTrackpad
+                                Material.accent: scrollPage.theme.accent
+                                Accessible.name: s["scroll.ignore_trackpad"]
+                                onToggled: backend.setIgnoreTrackpad(checked)
                             }
                         }
                     }
@@ -932,8 +1144,10 @@ Item {
                 startAtLoginSwitch.checked = backend.startAtLogin
                 startMinimizedSwitch.checked = backend.startMinimized
             }
+            checkUpdatesSwitch.checked = backend.checkForUpdates
             vscrollSwitch.checked = backend.invertVScroll
             hscrollSwitch.checked = backend.invertHScroll
+            ignoreTrackpadSwitch.checked = backend.ignoreTrackpad
         }
     }
 }

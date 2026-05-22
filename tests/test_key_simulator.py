@@ -2,7 +2,7 @@ import importlib
 import os
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from core import key_simulator
 
@@ -23,6 +23,57 @@ class KeySimulatorActionTests(unittest.TestCase):
         self.assertEqual(key_simulator.ACTIONS["prev_tab"]["category"], "Browser")
         self.assertTrue(len(key_simulator.ACTIONS["next_tab"]["keys"]) > 0)
         self.assertTrue(len(key_simulator.ACTIONS["prev_tab"]["keys"]) > 0)
+
+
+class CustomShortcutParsingTests(unittest.TestCase):
+    def test_build_custom_key_name_map_adds_common_aliases(self):
+        key_map = key_simulator._build_custom_key_name_map({
+            "ctrl": 1,
+            "alt": 2,
+            "super": 3,
+            "enter": 4,
+            "esc": 5,
+        })
+
+        self.assertEqual(key_map["control"], 1)
+        self.assertEqual(key_map["option"], 2)
+        self.assertEqual(key_map["opt"], 2)
+        self.assertEqual(key_map["cmd"], 3)
+        self.assertEqual(key_map["command"], 3)
+        self.assertEqual(key_map["meta"], 3)
+        self.assertEqual(key_map["win"], 3)
+        self.assertEqual(key_map["windows"], 3)
+        self.assertEqual(key_map["return"], 4)
+        self.assertEqual(key_map["escape"], 5)
+
+    def test_parse_custom_combo_accepts_digit_keys(self):
+        keys = key_simulator._parse_custom_combo(
+            "custom:ctrl+4",
+            {"ctrl": 17, "4": 52},
+        )
+        self.assertEqual(keys, [17, 52])
+
+    def test_parse_custom_combo_accepts_manual_shifted_symbols(self):
+        keys = key_simulator._parse_custom_combo(
+            "custom:ctrl+<",
+            {"ctrl": 17, "shift": 16, "comma": 188},
+        )
+        self.assertEqual(keys, [17, 16, 188])
+
+    def test_parse_custom_combo_rejects_multiple_non_modifier_keys(self):
+        self.assertIsNone(
+            key_simulator._parse_custom_combo(
+                "custom:ctrl+a+b",
+                {"ctrl": 17, "a": 65, "b": 66},
+            )
+        )
+
+    def test_windows_custom_shortcut_codes_include_f13_through_f24(self):
+        self.assertEqual(key_simulator.WINDOWS_FUNCTION_KEY_CODES["f1"], 0x70)
+        self.assertEqual(key_simulator.WINDOWS_FUNCTION_KEY_CODES["f12"], 0x7B)
+        self.assertEqual(key_simulator.WINDOWS_FUNCTION_KEY_CODES["f13"], 0x7C)
+        self.assertEqual(key_simulator.WINDOWS_FUNCTION_KEY_CODES["f24"], 0x87)
+
 
 class LinuxDesktopShortcutTests(unittest.TestCase):
     def _reload_for_linux(self, desktop: str):
@@ -57,6 +108,159 @@ class LinuxDesktopShortcutTests(unittest.TestCase):
             module.ACTIONS["space_right"]["keys"],
             [module.KEY_LEFTCTRL, module.KEY_LEFTMETA, module.KEY_RIGHT],
         )
+
+    def test_linux_custom_shortcuts_include_digit_keys_and_aliases(self):
+        module = self._reload_for_linux("GNOME")
+
+        self.assertEqual(module._KEY_NAME_TO_CODE["4"], module.KEY_4)
+        self.assertIn(module.KEY_4, module._ALL_KEY_CODES)
+        self.assertEqual(module._KEY_NAME_TO_CODE["control"], module.KEY_LEFTCTRL)
+        self.assertEqual(module._KEY_NAME_TO_CODE["cmd"], module.KEY_LEFTMETA)
+        self.assertEqual(module._KEY_NAME_TO_CODE["insert"], 110)
+        self.assertIn(module._KEY_NAME_TO_CODE["semicolon"], module._ALL_KEY_CODES)
+        self.assertIn(module._KEY_NAME_TO_CODE["f24"], module._ALL_KEY_CODES)
+
+
+class MacOSZoomActionTests(unittest.TestCase):
+    def _reload_for_macos(self):
+        with patch.object(sys, "platform", "darwin"):
+            importlib.reload(key_simulator)
+        self.addCleanup(importlib.reload, key_simulator)
+        return key_simulator
+
+    def test_zoom_actions_exist(self):
+        module = self._reload_for_macos()
+
+        self.assertEqual(module.ACTIONS["zoom_in"]["label"], "Zoom In")
+        self.assertEqual(module.ACTIONS["zoom_in"]["category"], "Navigation")
+        self.assertEqual(module.ACTIONS["zoom_in"]["keys"], [])
+        self.assertEqual(module.ACTIONS["zoom_out"]["label"], "Zoom Out")
+        self.assertEqual(module.ACTIONS["zoom_out"]["category"], "Navigation")
+        self.assertEqual(module.ACTIONS["zoom_out"]["keys"], [])
+
+    def test_zoom_in_sends_three_command_equal_presses(self):
+        module = self._reload_for_macos()
+
+        with patch.object(module, "send_key_combo") as send_key_combo:
+            module.execute_action("zoom_in")
+
+        expected = [module.kVK_Command, module.kVK_ANSI_Equal]
+        self.assertEqual(send_key_combo.call_count, 3)
+        send_key_combo.assert_has_calls([
+            call(expected, hold_ms=0),
+            call(expected, hold_ms=0),
+            call(expected, hold_ms=0),
+        ])
+
+    def test_zoom_out_sends_three_command_minus_presses(self):
+        module = self._reload_for_macos()
+
+        with patch.object(module, "send_key_combo") as send_key_combo:
+            module.execute_action("zoom_out")
+
+        expected = [module.kVK_Command, module.kVK_ANSI_Minus]
+        self.assertEqual(send_key_combo.call_count, 3)
+        send_key_combo.assert_has_calls([
+            call(expected, hold_ms=0),
+            call(expected, hold_ms=0),
+            call(expected, hold_ms=0),
+        ])
+
+    def test_existing_alt_tab_action_still_uses_standard_key_path(self):
+        module = self._reload_for_macos()
+
+        with patch.object(module, "send_key_combo") as send_key_combo:
+            module.execute_action("alt_tab")
+
+        send_key_combo.assert_called_once_with([module.kVK_Command, module.kVK_Tab])
+
+
+class CustomShortcutCaptureTests(unittest.TestCase):
+    def test_custom_action_label_uses_platform_display_names(self):
+        self.assertEqual(
+            key_simulator.custom_action_label(
+                "custom:cmd+w",
+                platform_name="darwin",
+            ),
+            "Cmd + W",
+        )
+        self.assertEqual(
+            key_simulator.custom_action_label(
+                "custom:super+w",
+                platform_name="win32",
+            ),
+            "Win + W",
+        )
+        self.assertEqual(
+            key_simulator.custom_action_label(
+                "custom:super+w",
+                platform_name="linux",
+            ),
+            "Super + W",
+        )
+
+    def test_macos_swaps_qt_control_and_meta_semantics(self):
+        self.assertEqual(
+            key_simulator.normalize_captured_shortcut_parts(
+                ["ctrl"],
+                "w",
+                platform_name="darwin",
+            ),
+            "super+w",
+        )
+        self.assertEqual(
+            key_simulator.normalize_captured_shortcut_parts(
+                ["super"],
+                "w",
+                platform_name="darwin",
+            ),
+            "ctrl+w",
+        )
+        self.assertEqual(
+            key_simulator.normalize_captured_shortcut_parts(
+                ["ctrl"],
+                "ctrl",
+                platform_name="darwin",
+            ),
+            "super",
+        )
+        self.assertEqual(
+            key_simulator.normalize_captured_shortcut_parts(
+                ["super"],
+                "super",
+                platform_name="darwin",
+            ),
+            "ctrl",
+        )
+
+    def test_non_macos_keeps_qt_control_and_meta_semantics(self):
+        self.assertEqual(
+            key_simulator.normalize_captured_shortcut_parts(
+                ["ctrl"],
+                "w",
+                platform_name="linux",
+            ),
+            "ctrl+w",
+        )
+        self.assertEqual(
+            key_simulator.normalize_captured_shortcut_parts(
+                ["super"],
+                "w",
+                platform_name="linux",
+            ),
+            "super+w",
+        )
+
+    def test_capture_normalization_accepts_punctuation_aliases(self):
+        self.assertEqual(
+            key_simulator.normalize_captured_shortcut_parts(
+                ["ctrl"],
+                "<",
+                platform_name="win32",
+            ),
+            "ctrl+shift+comma",
+        )
+
 
 class MouseButtonActionTests(unittest.TestCase):
     """Tests for the mouse-button-to-mouse-button remapping feature."""

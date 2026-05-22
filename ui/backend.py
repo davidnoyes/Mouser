@@ -4,11 +4,16 @@ Exposes properties, signals, and slots for two-way data binding.
 """
 
 import os
+import json
 import re
+import shutil
 import sys
+import threading
 import time
+import urllib.error
+import webbrowser
 
-from PySide6.QtCore import QMetaObject, QObject, Property, QTimer, Signal, Slot, Qt
+from PySide6.QtCore import QCoreApplication, QMetaObject, QObject, Property, QTimer, Signal, Slot, Qt, QUrl
 
 from core.accessibility import is_process_trusted
 from core.config import (
@@ -19,6 +24,12 @@ from core.config import (
 )
 from core import app_catalog
 from core.device_layouts import get_device_layout, get_manual_layout_choices
+from core.key_registry import (
+    ShortcutParseError,
+    canonical_shortcut_text,
+    is_reserved_risky_shortcut,
+    pretty_key_name,
+)
 from core.logi_devices import (
     DEFAULT_DPI_MAX,
     DEFAULT_DPI_MIN,
@@ -26,18 +37,160 @@ from core.logi_devices import (
     clamp_dpi,
     get_buttons_for_layout,
 )
-from core.key_simulator import ACTIONS, custom_action_label, valid_custom_key_names
+from core.key_simulator import (
+    ACTIONS,
+    custom_action_label,
+    normalize_captured_shortcut_parts,
+    valid_custom_key_names,
+)
 from core.startup import (
     apply_login_startup,
     supports_login_startup,
     sync_from_config as sync_login_startup_from_config,
 )
+from core.updater import (
+    DEFAULT_AUTO_CHECK_INTERVAL_SECONDS,
+    DEFAULT_RELEASE_REPO,
+    UpdateCheckState,
+    check_latest_release,
+    is_newer,
+)
+from core.update_installer import (
+    ArchiveRequirements,
+    UpdateInstallError,
+    WindowsUpdatePlan,
+    cleanup_stale_update_state,
+    extract_validated_zip,
+    fetch_update_manifest_for_release,
+    launch_windows_update_helper,
+    locate_runtime,
+    plan_install_for_platform,
+    prepare_downloaded_asset,
+    read_update_result,
+    same_volume_windows_stage_dir,
+    write_windows_update_plan,
+)
+from core.version import APP_VERSION
 
 
 def _action_label(action_id):
     if action_id.startswith("custom:"):
         return custom_action_label(action_id)
     return ACTIONS.get(action_id, {}).get("label", "Do Nothing")
+
+
+def _qt_shortcut_modifier_name(name):
+    """Return the raw Qt semantic name for a modifier."""
+    return (name or "").strip().lower()
+
+
+def _qt_enum_int(value):
+    """Coerce Qt enum and flag values from QML into plain integers."""
+    if hasattr(value, "value"):
+        return int(value.value)
+    return int(value)
+
+
+def _qt_shortcut_key_name(key, text=""):
+    """Translate a Qt key value into a raw Qt semantic shortcut name."""
+    key = _qt_enum_int(key)
+    text = text or ""
+
+    if key == _qt_enum_int(Qt.Key_Shift):
+        return "shift"
+    if key == _qt_enum_int(Qt.Key_Control):
+        return "ctrl"
+    if key == _qt_enum_int(Qt.Key_Alt):
+        return "alt"
+    if key == _qt_enum_int(Qt.Key_Meta):
+        return "super"
+    if key == _qt_enum_int(Qt.Key_Escape):
+        return "esc"
+    if key == _qt_enum_int(Qt.Key_Tab):
+        return "tab"
+    if key == _qt_enum_int(Qt.Key_Space):
+        return "space"
+    if key in (_qt_enum_int(Qt.Key_Return), _qt_enum_int(Qt.Key_Enter)):
+        return "enter"
+    if key == _qt_enum_int(Qt.Key_Backspace):
+        return "backspace"
+    if key == _qt_enum_int(Qt.Key_Delete):
+        return "delete"
+    if key == _qt_enum_int(Qt.Key_Left):
+        return "left"
+    if key == _qt_enum_int(Qt.Key_Right):
+        return "right"
+    if key == _qt_enum_int(Qt.Key_Up):
+        return "up"
+    if key == _qt_enum_int(Qt.Key_Down):
+        return "down"
+    if key == _qt_enum_int(Qt.Key_Home):
+        return "home"
+    if key == _qt_enum_int(Qt.Key_End):
+        return "end"
+    if key == _qt_enum_int(Qt.Key_PageUp):
+        return "pageup"
+    if key == _qt_enum_int(Qt.Key_PageDown):
+        return "pagedown"
+    if key == _qt_enum_int(Qt.Key_Insert):
+        return "insert"
+
+    for n in range(1, 25):
+        qt_key = getattr(Qt, f"Key_F{n}", None)
+        if qt_key is not None and key == _qt_enum_int(qt_key):
+            return f"f{n}"
+
+    if _qt_enum_int(Qt.Key_A) <= key <= _qt_enum_int(Qt.Key_Z):
+        return chr(ord("a") + (key - _qt_enum_int(Qt.Key_A)))
+    if _qt_enum_int(Qt.Key_0) <= key <= _qt_enum_int(Qt.Key_9):
+        return chr(ord("0") + (key - _qt_enum_int(Qt.Key_0)))
+
+    if len(text) == 1:
+        lowered = text.lower()
+        try:
+            canonical_shortcut_text(lowered, allow_modifier_only=False)
+        except ShortcutParseError:
+            pass
+        else:
+            return lowered
+    return ""
+
+
+def _qt_shortcut_combo(key, modifiers, text=""):
+    """Build the stored custom-shortcut string from Qt event parts."""
+    modifiers = _qt_enum_int(modifiers)
+    parts = []
+    if modifiers & _qt_enum_int(Qt.ControlModifier):
+        parts.append(_qt_shortcut_modifier_name("ctrl"))
+    if modifiers & _qt_enum_int(Qt.ShiftModifier):
+        parts.append("shift")
+    if modifiers & _qt_enum_int(Qt.AltModifier):
+        parts.append("alt")
+    if modifiers & _qt_enum_int(Qt.MetaModifier):
+        parts.append(_qt_shortcut_modifier_name("super"))
+
+    key_name = _qt_shortcut_key_name(key, text)
+    return normalize_captured_shortcut_parts(parts, key_name)
+
+
+def _open_url(url: str) -> bool:
+    """Open a URL without importing QtGui during backend module import."""
+    if not url:
+        return False
+    qurl = QUrl(url)
+    try:
+        from PySide6.QtGui import QDesktopServices
+
+        if QDesktopServices.openUrl(qurl):
+            return True
+    except Exception:
+        pass
+    return bool(webbrowser.open(qurl.toString()))
+
+
+def _update_install_enabled() -> bool:
+    value = os.environ.get("MOUSER_ENABLE_UPDATE_INSTALL", "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 class Backend(QObject):
@@ -62,6 +215,8 @@ class Backend(QObject):
     deviceLayoutChanged = Signal()
     hapticChanged = Signal()
     knownAppsChanged = Signal()
+    updateAvailable = Signal(str, str)
+    updateInstallChanged = Signal()
 
     # Internal cross-thread signals
     _profileSwitchRequest = Signal(str)
@@ -72,10 +227,15 @@ class Backend(QObject):
     _gestureEventRequest = Signal(object)
     _smartShiftReadRequest = Signal()
     _statusMessageRequest = Signal(str)
+    _updateAvailableRequest = Signal(str, str, bool, object)
+    _updateCheckFinishedRequest = Signal(bool, bool, object)
+    _updateInstallStateRequest = Signal(str, str, bool)
+    _updateInstallProgressRequest = Signal(int)
 
-    def __init__(self, engine=None, parent=None):
+    def __init__(self, engine=None, parent=None, root_dir=None):
         super().__init__(parent)
         self._engine = engine
+        self._root_dir = root_dir or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self._cfg = load_config()
         self._mouse_connected = False
         self._device_display_name = "Logitech mouse"
@@ -85,6 +245,7 @@ class Backend(QObject):
         self._device_dpi_min = DEFAULT_DPI_MIN
         self._device_dpi_max = DEFAULT_DPI_MAX
         self._connected_device_source = ""
+        self._connected_device_transport = ""
         self._battery_level = -1
         self._hid_features_ready = False
         self._debug_lines = []
@@ -104,6 +265,23 @@ class Backend(QObject):
         self._effective_supported_buttons = None  # set by _apply_device_layout
         self._connected_device_refresh_pending = False
         self._connected_device_refresh_attempts = 0
+        self._latest_update_url = ""
+        self._latest_update_version = ""
+        self._update_check_in_progress = False
+        self._update_install_status = "idle"
+        self._update_install_message = ""
+        self._update_install_can_install = False
+        self._update_install_progress = 0
+        self._update_cancel = threading.Event()
+        self._pending_update_plan = None
+        self._pending_update_plan_path = None
+        self._pending_update_helper_dir = None
+        self._update_state = UpdateCheckState.from_dict(
+            self._cfg.get("settings", {}).get("update_check_state", {})
+        )
+        self._update_timer = QTimer(self)
+        self._update_timer.setInterval(DEFAULT_AUTO_CHECK_INTERVAL_SECONDS * 1000)
+        self._update_timer.timeout.connect(lambda: self._startUpdateCheck(manual=False))
 
         # Cross-thread signal connections
         self._profileSwitchRequest.connect(
@@ -122,6 +300,14 @@ class Backend(QObject):
             self._handleSmartShiftRead, Qt.QueuedConnection)
         self._statusMessageRequest.connect(
             self._handleStatusMessage, Qt.QueuedConnection)
+        self._updateAvailableRequest.connect(
+            self._handleUpdateAvailable, Qt.QueuedConnection)
+        self._updateCheckFinishedRequest.connect(
+            self._handleUpdateCheckFinished, Qt.QueuedConnection)
+        self._updateInstallStateRequest.connect(
+            self._handleUpdateInstallState, Qt.QueuedConnection)
+        self._updateInstallProgressRequest.connect(
+            self._handleUpdateInstallProgress, Qt.QueuedConnection)
 
         # Wire engine callbacks
         if engine:
@@ -145,10 +331,30 @@ class Backend(QObject):
                 getattr(engine, "hid_features_ready", False)
             )
         if supports_login_startup():
-            sync_login_startup_from_config(self.startAtLogin)
+            try:
+                sync_login_startup_from_config(self.startAtLogin)
+            except Exception as exc:
+                print(f"[startup] Failed to sync desktop integration: {exc}", file=sys.stderr)
+                if self.startAtLogin:
+                    self._cfg.setdefault("settings", {})["start_at_login"] = False
+                    try:
+                        save_config(self._cfg)
+                    except Exception as save_exc:
+                        print(
+                            "[startup] Failed to save start-at-login recovery state: "
+                            f"{save_exc}",
+                            file=sys.stderr,
+                        )
+                    self.settingsChanged.emit()
+                    self.statusMessage.emit(
+                        "Start at login could not be enabled. Please try again."
+                    )
         else:
             self._cfg.setdefault("settings", {})["start_at_login"] = False
         self._sync_connected_device_info()
+        self._configureUpdateChecks()
+        self._consumeUpdateResultMarker()
+        self._cleanupStaleUpdatePreparation()
 
     # ── Properties ─────────────────────────────────────────────
 
@@ -380,6 +586,10 @@ class Backend(QObject):
     def invertHScroll(self):
         return self._cfg.get("settings", {}).get("invert_hscroll", False)
 
+    @Property(bool, notify=settingsChanged)
+    def ignoreTrackpad(self):
+        return self._cfg.get("settings", {}).get("ignore_trackpad", True)
+
     @Property(int, notify=settingsChanged)
     def gestureThreshold(self):
         return int(self._cfg.get("settings", {}).get("gesture_threshold", 50))
@@ -393,6 +603,51 @@ class Backend(QObject):
     def debugMode(self):
         return bool(self._cfg.get("settings", {}).get("debug_mode", False))
 
+    @Property(bool, notify=settingsChanged)
+    def checkForUpdates(self):
+        return bool(self._cfg.get("settings", {}).get("check_for_updates", True))
+
+    @Property(bool, constant=True)
+    def isWindows(self):
+        return sys.platform.startswith("win")
+
+    @Property(bool, constant=True)
+    def isLinux(self):
+        return sys.platform.startswith("linux")
+
+    @Property(str, notify=updateInstallChanged)
+    def latestUpdateVersion(self):
+        return self._latest_update_version
+
+    @Property(str, notify=updateInstallChanged)
+    def updateInstallStatus(self):
+        return self._update_install_status
+
+    @Property(str, notify=updateInstallChanged)
+    def updateInstallMessage(self):
+        return self._update_install_message
+
+    @Property(int, notify=updateInstallChanged)
+    def updateInstallProgress(self):
+        return int(self._update_install_progress)
+
+    @Property(bool, notify=updateInstallChanged)
+    def updateInstallCanInstall(self):
+        return self._update_install_can_install
+
+    @Property(bool, constant=True)
+    def updateInstallEnabled(self):
+        return _update_install_enabled()
+
+    @Property(bool, notify=updateInstallChanged)
+    def updateInstallInProgress(self):
+        return self._update_install_status in {
+            "checking",
+            "downloading",
+            "verifying",
+            "installing",
+        }
+
     @Property(bool, notify=debugEventsEnabledChanged)
     def debugEventsEnabled(self):
         return self._debug_events_enabled
@@ -400,6 +655,10 @@ class Backend(QObject):
     @Property(bool, constant=True)
     def supportsGestureDirections(self):
         return sys.platform in ("darwin", "win32", "linux")
+
+    @Property(bool, constant=True)
+    def isMacOS(self):
+        return sys.platform == "darwin"
 
     @Property(bool, constant=True)
     def accessibilityGranted(self):
@@ -431,6 +690,10 @@ class Backend(QObject):
     def connectedDeviceKey(self):
         return self._connected_device_key
 
+    @Property(str, notify=deviceInfoChanged)
+    def connectionType(self):
+        return self._connected_device_transport
+
     @Property(int, notify=deviceInfoChanged)
     def deviceDpiMin(self):
         return self._device_dpi_min
@@ -442,6 +705,12 @@ class Backend(QObject):
     @Property(str, notify=deviceLayoutChanged)
     def deviceImageAsset(self):
         return self._device_layout.get("image_asset", "mouse.png")
+
+    @Property(str, notify=deviceLayoutChanged)
+    def deviceImageSource(self):
+        asset = self._device_layout.get("image_asset", "mouse.png")
+        path = os.path.join(self._root_dir, "images", asset)
+        return QUrl.fromLocalFile(os.path.abspath(path)).toString()
 
     @Property(int, notify=deviceLayoutChanged)
     def deviceImageWidth(self):
@@ -590,6 +859,292 @@ class Backend(QObject):
             return catalog_id
         return entry.get("path") or fallback_spec
 
+    def _configureUpdateChecks(self):
+        if self.checkForUpdates:
+            if not self._update_timer.isActive():
+                self._update_timer.start()
+            QTimer.singleShot(3000, lambda: self._startUpdateCheck(manual=False))
+        else:
+            self._update_timer.stop()
+
+    def _startUpdateCheck(self, manual=False):
+        if not manual and not self.checkForUpdates:
+            return
+        if self._update_check_in_progress:
+            if manual:
+                self.statusMessage.emit("Update check already running")
+            return
+        self._update_check_in_progress = True
+        if manual:
+            self.statusMessage.emit("Checking for updates...")
+
+        thread = threading.Thread(
+            target=self._runUpdateCheck,
+            args=(bool(manual), self._update_state),
+            name="MouserUpdateCheck",
+            daemon=True,
+        )
+        thread.start()
+
+    def _runUpdateCheck(self, manual=False, state=None):
+        result = check_latest_release(
+            DEFAULT_RELEASE_REPO,
+            timeout=5.0,
+            state=state,
+            manual=bool(manual),
+        )
+        release = result.release
+        state_data = result.state.to_dict()
+        if release and is_newer(APP_VERSION, release.tag_name):
+            version = (
+                release.tag_name[1:]
+                if release.tag_name.startswith("v")
+                else release.tag_name
+            )
+            self._updateAvailableRequest.emit(
+                version, release.html_url, bool(manual), state_data
+            )
+            return
+        self._updateCheckFinishedRequest.emit(
+            bool(manual),
+            bool(result.reachable or result.not_modified or result.throttled),
+            state_data,
+        )
+
+    def _persistUpdateCheckState(self, state_data):
+        self._update_state = UpdateCheckState.from_dict(state_data)
+        self._cfg.setdefault("settings", {})["update_check_state"] = (
+            self._update_state.to_dict()
+        )
+        save_config(self._cfg)
+
+    @Slot(str, str, bool, object)
+    def _handleUpdateAvailable(self, version, url, manual, state_data):
+        self._update_check_in_progress = False
+        self._persistUpdateCheckState(state_data)
+        self._latest_update_version = str(version or "")
+        self._latest_update_url = str(url or "")
+        self._update_install_status = "available"
+        self._update_install_message = ""
+        self._update_install_can_install = False
+        self._pending_update_plan = None
+        self._pending_update_plan_path = None
+        self.updateInstallChanged.emit()
+        self.updateAvailable.emit(self._latest_update_version, self._latest_update_url)
+        self.statusMessage.emit(f"Mouser {self._latest_update_version} is available")
+
+    @Slot(bool, bool, object)
+    def _handleUpdateCheckFinished(self, manual, reachable, state_data):
+        self._update_check_in_progress = False
+        self._persistUpdateCheckState(state_data)
+        if manual:
+            if reachable:
+                self.statusMessage.emit("Mouser is up to date")
+            else:
+                self.statusMessage.emit("Could not check for updates")
+
+    def _setUpdateInstallState(self, status, message="", can_install=False):
+        self._update_install_status = str(status or "idle")
+        self._update_install_message = str(message or "")
+        self._update_install_can_install = bool(can_install)
+        if status not in {"downloading", "verifying", "ready_to_install"}:
+            self._update_install_progress = 0
+        self.updateInstallChanged.emit()
+
+    @Slot(str, str, bool)
+    def _handleUpdateInstallState(self, status, message, can_install):
+        self._setUpdateInstallState(status, message, can_install)
+
+    @Slot(int)
+    def _handleUpdateInstallProgress(self, value):
+        self._update_install_progress = max(0, min(100, int(value)))
+        self.updateInstallChanged.emit()
+
+    def _trustedBuildNumber(self):
+        try:
+            return int(self._update_state.highest_trusted_build or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _updateErrorCode(self, exc):
+        if isinstance(exc, UpdateInstallError):
+            return exc.code
+        if isinstance(exc, urllib.error.HTTPError):
+            return "metadata_missing" if exc.code == 404 else "network_error"
+        if isinstance(exc, (urllib.error.URLError, TimeoutError)):
+            return "network_error"
+        if isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)):
+            return "metadata_invalid"
+        if isinstance(exc, PermissionError):
+            return "permission_denied"
+        if isinstance(exc, OSError):
+            return "file_error"
+        return "error"
+
+    def _updateProgressCallback(self, expected_size):
+        def _progress(downloaded):
+            if expected_size:
+                self._updateInstallProgressRequest.emit(
+                    int(min(100, max(0, downloaded * 100 / expected_size)))
+                )
+
+        return _progress
+
+    def _raiseIfUpdateCancelled(self):
+        if self._update_cancel.is_set():
+            raise UpdateInstallError("cancelled", "Update cancelled.")
+
+    def _cleanupUpdatePreparation(self, stage_dir=None):
+        try:
+            cleanup_stale_update_state(locate_runtime().app_data_dir)
+        except Exception:
+            pass
+        if stage_dir is not None:
+            try:
+                shutil.rmtree(stage_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+    def _consumeUpdateResultMarker(self):
+        try:
+            runtime = locate_runtime()
+            marker = runtime.app_data_dir / "last-update-result.txt"
+            result = read_update_result(marker)
+            if not result:
+                return
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+            status = str(result.get("status") or "")
+            version = str(result.get("version") or "")
+            build_number = int(result.get("build_number") or 0)
+            if status == "installed":
+                if build_number > self._trustedBuildNumber():
+                    next_state = UpdateCheckState(
+                        **{
+                            **self._update_state.to_dict(),
+                            "highest_trusted_build": build_number,
+                        }
+                    )
+                    self._persistUpdateCheckState(next_state.to_dict())
+                self._setUpdateInstallState("installed", version, False)
+                self.statusMessage.emit(
+                    f"Updated to {version}" if version else "Update installed"
+                )
+            elif status == "failed":
+                self._setUpdateInstallState("error", "install_failed", False)
+        except Exception as exc:
+            print(f"[update] failed to consume update result marker: {exc}")
+
+    def _cleanupStaleUpdatePreparation(self):
+        try:
+            cleanup_stale_update_state(locate_runtime().app_data_dir)
+        except Exception:
+            pass
+
+    def _runPrepareLatestUpdate(self):
+        stage_dir = None
+        try:
+            version = self._latest_update_version
+            if not version:
+                self._updateInstallStateRequest.emit(
+                    "error", "check_first", False
+                )
+                return
+            tag = version if version.startswith("v") else f"v{version}"
+            self._raiseIfUpdateCancelled()
+            self._updateInstallStateRequest.emit("checking", "", False)
+            self._raiseIfUpdateCancelled()
+            manifest = fetch_update_manifest_for_release(
+                tag,
+                repo=DEFAULT_RELEASE_REPO,
+                highest_trusted_build=self._trustedBuildNumber(),
+            )
+            self._raiseIfUpdateCancelled()
+            runtime = locate_runtime()
+            self._raiseIfUpdateCancelled()
+            asset = manifest.assets.get(runtime.platform_key)
+            if asset is None:
+                self._raiseIfUpdateCancelled()
+                self._updateInstallStateRequest.emit(
+                    "manual_fallback",
+                    "no_asset",
+                    False,
+                )
+                return
+            if not runtime.platform_key.startswith("windows"):
+                plan_install_for_platform(manifest, runtime=runtime)
+                self._raiseIfUpdateCancelled()
+                platform_message = (
+                    "macos" if runtime.platform_key.startswith("macos") else "linux"
+                )
+                self._updateInstallStateRequest.emit(
+                    "manual_fallback", platform_message, False
+                )
+                return
+            if not self.updateInstallEnabled:
+                self._raiseIfUpdateCancelled()
+                self._updateInstallStateRequest.emit(
+                    "manual_fallback", "windows", False
+                )
+                return
+            if not runtime.update_supported:
+                self._raiseIfUpdateCancelled()
+                self._updateInstallStateRequest.emit(
+                    "manual_fallback", "windows", False
+                )
+                return
+
+            self._updateInstallStateRequest.emit("downloading", "", False)
+            archive_path = prepare_downloaded_asset(
+                asset,
+                download_dir=runtime.app_data_dir / "downloads" / tag,
+                cancel_event=self._update_cancel,
+                progress_callback=self._updateProgressCallback(asset.size),
+            )
+            self._raiseIfUpdateCancelled()
+            self._updateInstallStateRequest.emit("verifying", "", False)
+            stage_dir = same_volume_windows_stage_dir(runtime.install_root, tag)
+            staged = extract_validated_zip(
+                archive_path,
+                stage_dir,
+                requirements=ArchiveRequirements(require_windows_app=True),
+            )
+            self._raiseIfUpdateCancelled()
+            plan = plan_install_for_platform(manifest, runtime=runtime, staged=staged)
+            if not plan.can_install or not plan.staged:
+                self._updateInstallStateRequest.emit(
+                    plan.status, plan.message, plan.can_install
+                )
+                return
+            backup_root = runtime.install_root.with_name(
+                f"{runtime.install_root.name}.backup-{int(time.time())}"
+            )
+            result_marker = runtime.app_data_dir / "last-update-result.txt"
+            state_path = runtime.app_data_dir / "pending-update.json"
+            windows_plan = WindowsUpdatePlan(
+                current_pid=os.getpid(),
+                install_root=str(runtime.install_root),
+                staged_root=str(plan.staged.app_root),
+                backup_root=str(backup_root),
+                result_marker=str(result_marker),
+                target_version=manifest.version,
+                target_build_number=manifest.build_number,
+            )
+            write_windows_update_plan(windows_plan, state_path)
+            self._pending_update_plan = windows_plan
+            self._pending_update_plan_path = state_path
+            self._pending_update_helper_dir = runtime.app_data_dir / "helper" / tag
+            self._updateInstallStateRequest.emit("ready_to_install", "", True)
+        except Exception as exc:
+            code = self._updateErrorCode(exc)
+            self._cleanupUpdatePreparation(stage_dir)
+            if code == "cancelled":
+                self._updateInstallStateRequest.emit("cancelled", "", False)
+                return
+            self._updateInstallStateRequest.emit("error", code, False)
+
     # ── Slots ──────────────────────────────────────────────────
 
     @Slot(str, str)
@@ -623,22 +1178,117 @@ class Backend(QObject):
         self.statusMessage.emit("Saved")
 
     @Slot(bool)
+    def setCheckForUpdates(self, value):
+        enabled = bool(value)
+        if self.checkForUpdates == enabled:
+            return
+        self._cfg.setdefault("settings", {})["check_for_updates"] = enabled
+        save_config(self._cfg)
+        self.settingsChanged.emit()
+        self._configureUpdateChecks()
+        self.statusMessage.emit("Saved")
+
+    @Slot()
+    def manualCheckForUpdates(self):
+        self._startUpdateCheck(manual=True)
+
+    @Slot()
+    def openLatestReleasePage(self):
+        url = self._latest_update_url or (
+            f"https://github.com/{DEFAULT_RELEASE_REPO}/releases/latest"
+        )
+        _open_url(url)
+
+    @Slot()
+    def prepareLatestUpdate(self):
+        if self.updateInstallInProgress:
+            self.statusMessage.emit("Update is already in progress")
+            return
+        self._update_cancel.clear()
+        self._setUpdateInstallState("checking")
+        thread = threading.Thread(
+            target=self._runPrepareLatestUpdate,
+            name="MouserPrepareUpdate",
+            daemon=True,
+        )
+        thread.start()
+
+    @Slot()
+    def cancelUpdatePreparation(self):
+        if self._update_install_status not in {"checking", "downloading", "verifying"}:
+            return
+        self._update_cancel.set()
+        self._setUpdateInstallState("cancelled")
+
+    @Slot()
+    def installPreparedUpdate(self):
+        if not self.updateInstallEnabled:
+            self.statusMessage.emit("Open the release page to install manually")
+            return
+        if not self._pending_update_plan_path or not self._update_install_can_install:
+            self.statusMessage.emit("Update is not ready to install")
+            return
+        self._setUpdateInstallState("installing")
+        engine_stopped = False
+        try:
+            if self._engine:
+                # Release mouse hooks and HID grabs before replacing binaries.
+                self._engine.stop()
+                engine_stopped = True
+            launch_windows_update_helper(
+                self._pending_update_plan_path,
+                helper_dir=self._pending_update_helper_dir,
+            )
+        except Exception as exc:
+            if engine_stopped and self._engine:
+                try:
+                    self._engine.start()
+                except Exception as restart_exc:
+                    print(
+                        f"[update] failed to restart remapping after update error: {restart_exc}",
+                        file=sys.stderr,
+                    )
+            self._setUpdateInstallState("error", self._updateErrorCode(exc), False)
+            return
+        QCoreApplication.quit()
+
+    @Slot(bool)
     def setStartAtLogin(self, value):
         enabled = bool(value)
         if not supports_login_startup():
-            self.statusMessage.emit(
-                "Start at login is only available on Windows and macOS"
-            )
+            self.statusMessage.emit("Start at login is not available on this platform")
             return
-        if self.startAtLogin == enabled:
+        settings = self._cfg.setdefault("settings", {})
+        old_enabled = bool(settings.get("start_at_login", False))
+        if old_enabled == enabled:
             return
-        self._cfg.setdefault("settings", {})["start_at_login"] = enabled
-        save_config(self._cfg)
         try:
             apply_login_startup(enabled)
         except Exception as exc:
             self.settingsChanged.emit()
             self.statusMessage.emit(f"Failed to update login item: {exc}")
+            return
+        settings["start_at_login"] = enabled
+        try:
+            save_config(self._cfg)
+        except Exception as exc:
+            settings["start_at_login"] = old_enabled
+            rollback_error = None
+            try:
+                apply_login_startup(old_enabled)
+            except Exception as rollback_exc:
+                rollback_error = rollback_exc
+                print(
+                    "[Backend] Failed to roll back start-at-login OS state "
+                    f"after config save failure: {rollback_exc}"
+                )
+            self.settingsChanged.emit()
+            if rollback_error is not None:
+                self.statusMessage.emit(
+                    "Start-at-login state is inconsistent; please restart Mouser to recover."
+                )
+            else:
+                self.statusMessage.emit(f"Failed to save login item setting: {exc}")
             return
         self.settingsChanged.emit()
         self.statusMessage.emit(
@@ -658,6 +1308,18 @@ class Backend(QObject):
     def _applySmartShift(self, mode=None, enabled=None, threshold=None):
         """Update one or more SmartShift settings, persist config, and push to device."""
         settings = self._cfg.setdefault("settings", {})
+        current_mode = settings.get("smart_shift_mode", "ratchet")
+        current_enabled = settings.get("smart_shift_enabled", False)
+        current_threshold = settings.get("smart_shift_threshold", 25)
+        next_mode = current_mode if mode is None else mode
+        next_enabled = current_enabled if enabled is None else enabled
+        next_threshold = current_threshold if threshold is None else threshold
+        if (
+            next_mode == current_mode
+            and next_enabled == current_enabled
+            and next_threshold == current_threshold
+        ):
+            return
         if mode is not None:
             settings["smart_shift_mode"] = mode
         if enabled is not None:
@@ -742,6 +1404,9 @@ class Backend(QObject):
 
     @Slot(bool)
     def setInvertVScroll(self, value):
+        value = bool(value)
+        if self.invertVScroll == value:
+            return
         self._cfg.setdefault("settings", {})["invert_vscroll"] = value
         save_config(self._cfg)
         if self._engine:
@@ -750,7 +1415,18 @@ class Backend(QObject):
 
     @Slot(bool)
     def setInvertHScroll(self, value):
+        value = bool(value)
+        if self.invertHScroll == value:
+            return
         self._cfg.setdefault("settings", {})["invert_hscroll"] = value
+        save_config(self._cfg)
+        if self._engine:
+            self._engine.reload_mappings()
+        self.settingsChanged.emit()
+
+    @Slot(bool)
+    def setIgnoreTrackpad(self, value):
+        self._cfg.setdefault("settings", {})["ignore_trackpad"] = value
         save_config(self._cfg)
         if self._engine:
             self._engine.reload_mappings()
@@ -919,6 +1595,50 @@ class Backend(QObject):
     def actionLabelFor(self, actionId):
         return _action_label(actionId)
 
+    @Slot(int, int, str, result=str)
+    def shortcutComboFromQtEvent(self, key, modifiers, text):
+        return _qt_shortcut_combo(key, modifiers, text)
+
+    @Slot(str, result=str)
+    def canonicalizeCustomShortcut(self, text):
+        try:
+            return canonical_shortcut_text(
+                text,
+                allow_modifier_only=False,
+                platform_name=sys.platform,
+            )
+        except ShortcutParseError:
+            return ""
+
+    @Slot(str, result="QVariantMap")
+    def customShortcutValidationErrorInfo(self, text):
+        try:
+            canonical_shortcut_text(
+                text,
+                allow_modifier_only=False,
+                platform_name=sys.platform,
+            )
+        except ShortcutParseError as exc:
+            return {
+                "code": getattr(exc, "code", "") or "unsupported",
+                "detail": getattr(exc, "detail", "") or "",
+            }
+        return {}
+
+    @Slot(str, result=bool)
+    def isReservedCustomShortcut(self, text):
+        try:
+            return is_reserved_risky_shortcut(text, allow_modifier_only=False)
+        except ShortcutParseError:
+            return False
+
+    @Slot(str, result=str)
+    def displayShortcutKeyName(self, name):
+        try:
+            return pretty_key_name(name, platform_name=sys.platform)
+        except ShortcutParseError:
+            return name
+
     @Slot(result=str)
     def dumpDeviceInfo(self):
         """Return JSON describing the connected device for contributor use."""
@@ -1009,16 +1729,24 @@ class Backend(QObject):
     def _handleSmartShiftRead(self):
         """Runs on Qt main thread — updates config and notifies QML."""
         state = self._pending_smart_shift_state
-        if isinstance(state, dict):
-            settings = self._cfg.setdefault("settings", {})
-            settings["smart_shift_mode"] = state.get("mode", "ratchet")
-            settings["smart_shift_enabled"] = state.get("enabled", False)
-            # Only accept the device-reported threshold when SmartShift is
-            # enabled (device returns the real value 1-50).  When disabled the
-            # device returns 0xFF which the read code maps to a hardcoded 25,
-            # overwriting whatever the user chose in the UI.
-            if state.get("enabled", False):
-                settings["smart_shift_threshold"] = state.get("threshold", 25)
+        if not isinstance(state, dict):
+            return
+        settings = self._cfg.setdefault("settings", {})
+        mode = state.get("mode", "ratchet")
+        enabled = bool(state.get("enabled", False))
+        settings["smart_shift_enabled"] = enabled
+        # Hardware reads cannot report the user's saved fixed-mode fallback while
+        # SmartShift auto-switching is enabled: the device only exposes ratchet +
+        # threshold in that state. Preserve the existing fallback mode unless the
+        # callback explicitly carries free-spin (the engine's saved-state replay).
+        if not enabled or mode == "freespin":
+            settings["smart_shift_mode"] = mode
+        # Only accept the device-reported threshold when SmartShift is
+        # enabled (device returns the real value 1-50).  When disabled the
+        # device returns 0xFF which the read code maps to a hardcoded 25,
+        # overwriting whatever the user chose in the UI.
+        if enabled:
+            settings["smart_shift_threshold"] = state.get("threshold", 25)
         self.smartShiftChanged.emit()
 
     def _onEngineStatusMessage(self, message):
@@ -1134,6 +1862,12 @@ class Backend(QObject):
         self._connected_device_refresh_pending = False
         if not self._mouse_connected:
             return
+        previous_hid_features_ready = self._hid_features_ready
+        self._hid_features_ready = bool(
+            getattr(self._engine, "hid_features_ready", False)
+        ) if self._engine else False
+        if self._hid_features_ready != previous_hid_features_ready:
+            self.hidFeaturesReadyChanged.emit()
         self._connected_device_refresh_attempts += 1
         self._sync_connected_device_info()
 
@@ -1141,6 +1875,7 @@ class Backend(QObject):
         device_key = getattr(device, "key", "") or ""
         display_name = getattr(device, "display_name", "") or "Logitech mouse"
         source = getattr(device, "source", "") or ""
+        transport = getattr(device, "transport", "") or ""
         dpi_min = getattr(device, "dpi_min", DEFAULT_DPI_MIN) or DEFAULT_DPI_MIN
         dpi_max = getattr(device, "dpi_max", DEFAULT_DPI_MAX) or DEFAULT_DPI_MAX
         info_changed = False
@@ -1152,6 +1887,9 @@ class Backend(QObject):
             info_changed = True
         if source != self._connected_device_source:
             self._connected_device_source = source
+            info_changed = True
+        if transport != self._connected_device_transport:
+            self._connected_device_transport = transport
             info_changed = True
         if dpi_min != self._device_dpi_min:
             self._device_dpi_min = dpi_min

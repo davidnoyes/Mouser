@@ -48,28 +48,34 @@ Look at the `reprog_controls` array.  Each entry has a `cid` (Control ID) and
 
 Not all CIDs are divertable.  Check the `flags` field -- if bit `0x0020` is
 set, the control can be intercepted by Mouser.
+Directional gesture mappings also require RawXY support (`0x0100` or
+`0x0200`) and a successful RawXY divert during connection.
 
 ---
 
 ## 3. Add the device definition
 
-### a) Edit `core/logi_devices.py`
+### a) Add a device catalog entry
 
-Add a new `LogiDeviceSpec` entry to the `KNOWN_LOGI_DEVICES` tuple:
+For exact device support, edit `core/logi_device_catalog.py` first. This file
+holds Mouser's community-maintained per-device Logitech entries, including the
+device image and hotspot coordinates used by the UI.
+
+Add a new dict to `LOGI_DEVICE_SPECS`:
 
 ```python
-LogiDeviceSpec(
-    key="mx_ergo",                      # unique snake_case key
-    display_name="MX Ergo",             # human-readable name
-    product_ids=(0xB0XX,),              # from your dump's product_id
-    aliases=("Logitech MX Ergo",),      # alternative names the device may report
-    ui_layout="generic_mouse",          # or a custom layout key (see step 4)
-    image_asset="icons/mouse-simple.svg",  # or a custom image (see step 4)
-    supported_buttons=GENERIC_BUTTONS,  # adjust to match your mouse
-    gesture_cids=(0x00C3,),             # from gesture_candidates in your dump
-    dpi_min=200,
-    dpi_max=4000,                       # from discovered DPI range, or Logitech specs
-),
+{
+    "key": "example_mouse",                    # unique snake_case key
+    "display_name": "Example Mouse",           # human-readable name
+    "product_ids": (0xB0XX,),                  # from your dump's product_id
+    "aliases": ("Logitech Example Mouse",),    # alternative names the device may report
+    "ui_layout": "example_mouse",              # exact layout key
+    "image_asset": "logitech-mice/example_mouse/mouse.png",
+    "supported_buttons": GENERIC_BUTTONS,      # adjust to match your mouse
+    "gesture_cids": (0x00C3,),                 # from gesture_candidates in your dump
+    "dpi_min": 200,
+    "dpi_max": 4000,                           # from discovered DPI range, or vendor specs
+},
 ```
 
 Pick the right button tuple for `supported_buttons`:
@@ -80,43 +86,55 @@ Pick the right button tuple for `supported_buttons`:
 - `GENERIC_BUTTONS` -- middle, back, forward (safe default)
 - Or define a new tuple if your mouse has a unique button set.
 
-### b) (Optional) Add an interactive layout
+`supported_buttons` is a static fallback.  When Mouser connects through HID++
+and discovers `REPROG_V4` controls, it may narrow HID++-gated buttons such as
+gesture, Smart Shift / mode shift, and DPI switch based on the runtime control
+table.  Unknown CIDs are intentionally not exposed until Mouser has code that
+knows how to handle them.  Horizontal scroll remains catalog-driven because
+some devices implement it as OS events or side-button + wheel behavior instead
+of a standalone reprogrammable control.
+
+Use `core/logi_devices.py` only when you are adding a broader family fallback
+without exact art yet.
+
+### b) Add an exact interactive layout
 
 If you want the mouse page to show an interactive diagram with clickable
-hotspot dots:
+hotspot dots, add a layout dict in `core/logi_device_catalog.py` instead of
+growing `core/device_layouts.py`:
 
-1. Create an image of your mouse (top-down PNG or SVG, ~400x350 px).
-   Place it in `images/`.
-2. Add a layout dict in `core/device_layouts.py`:
+1. Create a small image set for your mouse and place it in
+   `images/logitech-mice/<device-key>/`.
+2. Add a layout dict to `LOGI_DEVICE_LAYOUTS`:
 
 ```python
-MY_DEVICE_LAYOUT = {
-    "key": "my_device",
-    "label": "My Device family",
-    "image_asset": "mouse_my_device.svg",
-    "image_width": 400,
-    "image_height": 350,
+"example_mouse": {
+    "key": "example_mouse",
+    "label": "Example Mouse",
+    "image_asset": "logitech-mice/example_mouse/mouse.png",
+    "image_width": 260,
+    "image_height": 400,
     "interactive": True,
-    "manual_selectable": True,
+    "manual_selectable": False,
     "note": "",
     "hotspots": [
         {
-            "buttonKey": "middle",       # must match a supported_buttons entry
+            "buttonKey": "middle",      # must match a supported_buttons entry
             "label": "Middle button",
-            "summaryType": "mapping",    # "mapping", "gesture", or "hscroll"
+            "summaryType": "mapping",   # "mapping", "gesture", or "hscroll"
             "normX": 0.50,              # 0-1, fraction of image width
             "normY": 0.30,              # 0-1, fraction of image height
             "labelSide": "right",       # "left" or "right"
             "labelOffX": 150,           # pixel offset for the annotation line
             "labelOffY": -60,
         },
-        # ... one entry per visible button
     ],
-}
+},
 ```
 
-3. Register it in the `DEVICE_LAYOUTS` dict at the bottom of the file.
-4. Set `ui_layout` in your `LogiDeviceSpec` to match the layout key.
+`core/device_layouts.py` still owns shared manual family layouts such as
+`mx_master`, `mx_anywhere`, and `mx_vertical`.  Keep those family entries
+manual-selectable; keep exact per-device layouts auto-detected only.
 
 ### Estimating hotspot coordinates
 
@@ -124,6 +142,14 @@ Open your image in any editor that shows cursor coordinates.  Divide the
 cursor X by image width and cursor Y by image height to get `normX`/`normY`.
 The label offset values control where the annotation text appears relative to
 the dot -- experiment with positive/negative values until it looks right.
+
+### Keep it small
+
+- Prefer focused, reviewable device entries over large multi-device changes.
+- Keep image assets and hotspot data close to what the UI actually uses.
+- Prefer exact per-device entries for hardware that has been checked in-app.
+- If the device is only partially understood, add a family fallback first and
+  leave the exact layout for a follow-up contribution.
 
 ---
 

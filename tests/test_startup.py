@@ -1,6 +1,9 @@
+import os
+import plistlib
 import sys
+import tempfile
 import unittest
-from unittest.mock import MagicMock, mock_open, patch
+from unittest.mock import MagicMock, patch
 
 from core import startup as st
 
@@ -158,8 +161,124 @@ class ApplyLoginStartupMacTests(unittest.TestCase):
         )
 
     def test_macos_enable_writes_plist_and_bootstraps(self):
-        plist = "/tmp/io.github.tombadash.mouser.plist"
         domain = "gui/501"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plist = os.path.join(tmp, "LaunchAgents", "io.github.tombadash.mouser.plist")
+
+            with (
+                patch.object(sys, "platform", "darwin"),
+                patch("core.startup.os.getuid", return_value=501, create=True),
+                patch.object(st, "supports_login_startup", return_value=True),
+                patch.object(st, "_macos_plist_path", return_value=plist),
+                patch.object(st, "_program_arguments", return_value=["/X/Mouser"]),
+                patch.object(st, "_launchctl_run") as m_lc,
+            ):
+                m_lc.return_value = MagicMock(returncode=0)
+                st.apply_login_startup(True)
+
+            with open(plist, "rb") as f:
+                payload = plistlib.load(f)
+            self.assertEqual(payload["ProgramArguments"], ["/X/Mouser"])
+            self.assertTrue(payload["RunAtLoad"])
+            self.assertEqual(m_lc.call_count, 1)
+            m_lc.assert_called_with(
+                ["launchctl", "bootstrap", domain, plist]
+            )
+
+    def test_macos_enable_raises_and_removes_plist_when_bootstrap_fails(self):
+        domain = "gui/501"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plist = os.path.join(tmp, "io.github.tombadash.mouser.plist")
+
+            with (
+                patch.object(sys, "platform", "darwin"),
+                patch("core.startup.os.getuid", return_value=501, create=True),
+                patch.object(st, "supports_login_startup", return_value=True),
+                patch.object(st, "_macos_plist_path", return_value=plist),
+                patch.object(st, "_program_arguments", return_value=["/X/Mouser"]),
+                patch.object(st, "_launchctl_run") as m_lc,
+            ):
+                m_lc.return_value = MagicMock(
+                    returncode=5,
+                    stderr="Bootstrap failed",
+                    stdout="",
+                )
+                with self.assertRaisesRegex(RuntimeError, "launchctl bootstrap failed"):
+                    st.apply_login_startup(True)
+
+            m_lc.assert_called_once_with(
+                ["launchctl", "bootstrap", domain, plist]
+            )
+            self.assertFalse(os.path.exists(plist))
+
+    def test_macos_enable_reports_cleanup_failure_after_bootstrap_fails(self):
+        domain = "gui/501"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plist = os.path.join(tmp, "io.github.tombadash.mouser.plist")
+
+            with (
+                patch.object(sys, "platform", "darwin"),
+                patch("core.startup.os.getuid", return_value=501, create=True),
+                patch.object(st, "supports_login_startup", return_value=True),
+                patch.object(st, "_macos_plist_path", return_value=plist),
+                patch.object(st, "_program_arguments", return_value=["/X/Mouser"]),
+                patch.object(st, "_launchctl_run") as m_lc,
+                patch("core.startup.os.remove", side_effect=OSError("cleanup failed")),
+            ):
+                m_lc.return_value = MagicMock(
+                    returncode=5,
+                    stderr="Bootstrap failed",
+                    stdout="",
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "additionally failed to restore the previous launch agent",
+                ) as ctx:
+                    st.apply_login_startup(True)
+
+            self.assertIn("cleanup failed", str(ctx.exception))
+
+    def test_macos_enable_restores_existing_plist_when_bootstrap_fails(self):
+        domain = "gui/501"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plist = os.path.join(tmp, "io.github.tombadash.mouser.plist")
+            with open(plist, "wb") as f:
+                f.write(b"old plist")
+
+            with (
+                patch.object(sys, "platform", "darwin"),
+                patch("core.startup.os.getuid", return_value=501, create=True),
+                patch.object(st, "supports_login_startup", return_value=True),
+                patch.object(st, "_macos_plist_path", return_value=plist),
+                patch.object(st, "_program_arguments", return_value=["/X/Mouser"]),
+                patch.object(st, "_launchctl_run") as m_lc,
+            ):
+                m_lc.side_effect = [
+                    MagicMock(returncode=0),
+                    MagicMock(returncode=5, stderr="Bootstrap failed", stdout=""),
+                    MagicMock(returncode=0),
+                ]
+
+                with self.assertRaisesRegex(RuntimeError, "launchctl bootstrap failed"):
+                    st.apply_login_startup(True)
+
+            with open(plist, "rb") as f:
+                self.assertEqual(f.read(), b"old plist")
+            self.assertEqual(
+                [call.args[0] for call in m_lc.call_args_list],
+                [
+                    ["launchctl", "bootout", domain, plist],
+                    ["launchctl", "bootstrap", domain, plist],
+                    ["launchctl", "bootstrap", domain, plist],
+                ],
+            )
+
+    def test_macos_enable_does_not_bootout_when_existing_plist_cannot_be_preserved(self):
+        plist = "/tmp/io.github.tombadash.mouser.plist"
 
         with (
             patch.object(sys, "platform", "darwin"),
@@ -168,20 +287,59 @@ class ApplyLoginStartupMacTests(unittest.TestCase):
             patch.object(st, "_macos_plist_path", return_value=plist),
             patch.object(st, "_program_arguments", return_value=["/X/Mouser"]),
             patch.object(st, "_launchctl_run") as m_lc,
-            patch("os.makedirs") as m_makedirs,
-            patch("os.path.isfile", return_value=False),
-            patch("builtins.open", mock_open()) as m_open,
-            patch("core.startup.plistlib.dump"),
+            patch("os.makedirs"),
+            patch("os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=OSError("read failed")),
         ):
-            m_lc.return_value = MagicMock(returncode=0)
-            st.apply_login_startup(True)
+            with self.assertRaisesRegex(RuntimeError, "failed to preserve"):
+                st.apply_login_startup(True)
 
-        m_makedirs.assert_called_once()
-        m_open.assert_called_once_with(plist, "wb")
-        self.assertEqual(m_lc.call_count, 1)
-        m_lc.assert_called_with(
-            ["launchctl", "bootstrap", domain, plist]
-        )
+        m_lc.assert_not_called()
+
+    def test_macos_enable_restores_existing_plist_when_write_fails_after_bootout(self):
+        domain = "gui/501"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plist = os.path.join(tmp, "io.github.tombadash.mouser.plist")
+            with open(plist, "wb") as f:
+                f.write(b"old plist")
+
+            write_calls = []
+
+            def fake_atomic_write(path, data):
+                write_calls.append((path, data))
+                if len(write_calls) == 1:
+                    raise OSError("write failed")
+                with open(path, "wb") as f:
+                    f.write(data)
+
+            with (
+                patch.object(sys, "platform", "darwin"),
+                patch("core.startup.os.getuid", return_value=501, create=True),
+                patch.object(st, "supports_login_startup", return_value=True),
+                patch.object(st, "_macos_plist_path", return_value=plist),
+                patch.object(st, "_program_arguments", return_value=["/X/Mouser"]),
+                patch.object(st, "_launchctl_run") as m_lc,
+                patch.object(st, "_atomic_write_file", side_effect=fake_atomic_write),
+            ):
+                m_lc.side_effect = [
+                    MagicMock(returncode=0),
+                    MagicMock(returncode=0),
+                ]
+
+                with self.assertRaisesRegex(RuntimeError, "failed to update launch agent"):
+                    st.apply_login_startup(True)
+
+            with open(plist, "rb") as f:
+                self.assertEqual(f.read(), b"old plist")
+            self.assertEqual(len(write_calls), 2)
+            self.assertEqual(
+                [call.args[0] for call in m_lc.call_args_list],
+                [
+                    ["launchctl", "bootout", domain, plist],
+                    ["launchctl", "bootstrap", domain, plist],
+                ],
+            )
 
     def test_macos_disable_bootout_and_remove_when_plist_exists(self):
         plist = "/tmp/io.github.tombadash.mouser.plist"
@@ -235,6 +393,177 @@ class SyncFromConfigTests(unittest.TestCase):
         with patch.object(st, "apply_login_startup") as mock_apply:
             st.sync_from_config(True)
         mock_apply.assert_called_once_with(True)
+
+
+class ApplyLoginStartupLinuxTests(unittest.TestCase):
+    def test_supports_login_startup_on_linux(self):
+        with patch.object(sys, "platform", "linux"):
+            self.assertTrue(st.supports_login_startup())
+
+    def test_linux_source_checkout_prefers_project_venv_python(self):
+        with (
+            patch.object(sys, "platform", "linux"),
+            patch.object(sys, "frozen", False, create=True),
+            patch.object(sys, "executable", "/usr/bin/python"),
+            patch.object(sys, "argv", ["/tmp/Mouser/main_qml.py"]),
+            patch("os.path.abspath", side_effect=lambda p: p),
+            patch("os.path.isfile", side_effect=lambda p: p == "/tmp/Mouser/.venv/bin/python"),
+            patch("os.access", side_effect=lambda p, mode: p == "/tmp/Mouser/.venv/bin/python"),
+        ):
+            args = st._desktop_exec_parts()
+
+        self.assertEqual(
+            args,
+            ["/tmp/Mouser/.venv/bin/python", "/tmp/Mouser/main_qml.py"],
+        )
+
+    def test_linux_desktop_exec_can_force_visible_window(self):
+        with (
+            patch.object(sys, "platform", "linux"),
+            patch.object(sys, "frozen", False, create=True),
+            patch.object(sys, "executable", "/usr/bin/python"),
+            patch.object(sys, "argv", ["/tmp/Mouser/main_qml.py"]),
+            patch("os.path.abspath", side_effect=lambda p: p),
+            patch("os.path.isfile", return_value=False),
+        ):
+            args = st._desktop_exec_parts(force_show=True)
+
+        self.assertEqual(
+            args,
+            ["/usr/bin/python", "/tmp/Mouser/main_qml.py", "--show-window"],
+        )
+
+    def test_linux_enable_writes_launcher_and_autostart_entries(self):
+        template = """[Desktop Entry]
+Name=@APP_NAME@
+Exec=@EXEC@
+TryExec=@TRY_EXEC@
+Path=@WORKDIR@
+Icon=@ICON@
+X-Mouser-SourcePath=@SOURCE_PATH@
+@AUTOSTART_LINES@
+"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            template_path = os.path.join(tmpdir, "mouser.desktop.in")
+            launcher_path = os.path.join(tmpdir, "applications", st.LINUX_DESKTOP_ENTRY_NAME)
+            autostart_path = os.path.join(tmpdir, "autostart", st.LINUX_DESKTOP_ENTRY_NAME)
+            with open(template_path, "w", encoding="utf-8") as fh:
+                fh.write(template)
+
+            with (
+                patch.object(sys, "platform", "linux"),
+                patch.object(st, "supports_login_startup", return_value=True),
+                patch.object(
+                    st,
+                    "_desktop_exec_parts",
+                    return_value=[
+                        "/tmp/Mouser Build/.venv/bin/python",
+                        "/tmp/Mouser Build/main_qml.py",
+                    ],
+                ),
+                patch.object(st, "_runtime_root_dir", return_value="/tmp/Mouser Build"),
+                patch.object(st, "_linux_icon_path", return_value="/tmp/Mouser Build/images/logo_icon.png"),
+                patch.object(st, "_linux_source_path", return_value="/tmp/Mouser Build/main_qml.py"),
+                patch.object(st, "_linux_template_path", return_value=template_path),
+                patch.object(st, "_linux_desktop_path", return_value=launcher_path),
+                patch.object(st, "_linux_autostart_path", return_value=autostart_path),
+            ):
+                st.apply_login_startup(True)
+
+            with open(launcher_path, "r", encoding="utf-8") as fh:
+                launcher_text = fh.read()
+            with open(autostart_path, "r", encoding="utf-8") as fh:
+                autostart_text = fh.read()
+
+        self.assertIn('Exec="/tmp/Mouser Build/.venv/bin/python" "/tmp/Mouser Build/main_qml.py"', launcher_text)
+        self.assertIn("TryExec=/tmp/Mouser Build/.venv/bin/python", launcher_text)
+        self.assertIn("Path=/tmp/Mouser Build", launcher_text)
+        self.assertIn("X-Mouser-SourcePath=/tmp/Mouser Build/main_qml.py", launcher_text)
+        self.assertNotIn("X-GNOME-Autostart-enabled=true", launcher_text)
+        self.assertIn("X-GNOME-Autostart-enabled=true", autostart_text)
+        self.assertIn(
+            f"X-GNOME-Autostart-Delay={st.LINUX_AUTOSTART_DELAY_SECONDS}",
+            autostart_text,
+        )
+        self.assertIn("Hidden=false", autostart_text)
+
+    def test_linux_template_path_prefers_pyinstaller_bundle_resource(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundled_dir = os.path.join(tmpdir, "linux")
+            os.makedirs(bundled_dir)
+            bundled_template = os.path.join(bundled_dir, st.LINUX_DESKTOP_TEMPLATE_NAME)
+            with open(bundled_template, "w", encoding="utf-8") as fh:
+                fh.write("[Desktop Entry]\n")
+
+            with (
+                patch.object(sys, "platform", "linux"),
+                patch.object(sys, "frozen", True, create=True),
+                patch.object(sys, "_MEIPASS", tmpdir, create=True),
+            ):
+                self.assertEqual(st._linux_template_path(), bundled_template)
+
+    def test_linux_disable_removes_autostart_but_keeps_launcher(self):
+        template = """[Desktop Entry]
+Name=@APP_NAME@
+Exec=@EXEC@
+TryExec=@TRY_EXEC@
+Path=@WORKDIR@
+Icon=@ICON@
+X-Mouser-SourcePath=@SOURCE_PATH@
+@AUTOSTART_LINES@
+"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            template_path = os.path.join(tmpdir, "mouser.desktop.in")
+            launcher_path = os.path.join(tmpdir, "applications", st.LINUX_DESKTOP_ENTRY_NAME)
+            autostart_path = os.path.join(tmpdir, "autostart", st.LINUX_DESKTOP_ENTRY_NAME)
+            with open(template_path, "w", encoding="utf-8") as fh:
+                fh.write(template)
+            os.makedirs(os.path.dirname(autostart_path), exist_ok=True)
+            with open(autostart_path, "w", encoding="utf-8") as fh:
+                fh.write("stale")
+
+            with (
+                patch.object(sys, "platform", "linux"),
+                patch.object(st, "supports_login_startup", return_value=True),
+                patch.object(st, "_desktop_exec_parts", return_value=["/tmp/Mouser/python"]),
+                patch.object(st, "_runtime_root_dir", return_value="/tmp/Mouser"),
+                patch.object(st, "_linux_icon_path", return_value="/tmp/Mouser/images/logo_icon.png"),
+                patch.object(st, "_linux_source_path", return_value="/tmp/Mouser"),
+                patch.object(st, "_linux_template_path", return_value=template_path),
+                patch.object(st, "_linux_desktop_path", return_value=launcher_path),
+                patch.object(st, "_linux_autostart_path", return_value=autostart_path),
+            ):
+                st.apply_login_startup(False)
+
+            self.assertTrue(os.path.isfile(launcher_path))
+            self.assertFalse(os.path.exists(autostart_path))
+
+    def test_linux_disable_removes_autostart_even_when_launcher_template_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            launcher_path = os.path.join(tmpdir, "applications", st.LINUX_DESKTOP_ENTRY_NAME)
+            autostart_path = os.path.join(tmpdir, "autostart", st.LINUX_DESKTOP_ENTRY_NAME)
+            missing_template = os.path.join(tmpdir, "missing.desktop.in")
+            os.makedirs(os.path.dirname(autostart_path), exist_ok=True)
+            with open(autostart_path, "w", encoding="utf-8") as fh:
+                fh.write("stale")
+
+            with (
+                patch.object(sys, "platform", "linux"),
+                patch.object(st, "supports_login_startup", return_value=True),
+                patch.object(st, "_desktop_exec_parts", return_value=["/tmp/Mouser/python"]),
+                patch.object(st, "_runtime_root_dir", return_value="/tmp/Mouser"),
+                patch.object(st, "_linux_icon_path", return_value="/tmp/Mouser/images/logo_icon.png"),
+                patch.object(st, "_linux_source_path", return_value="/tmp/Mouser"),
+                patch.object(st, "_linux_template_path", return_value=missing_template),
+                patch.object(st, "_linux_desktop_path", return_value=launcher_path),
+                patch.object(st, "_linux_autostart_path", return_value=autostart_path),
+            ):
+                st.apply_login_startup(False)
+
+            self.assertFalse(os.path.exists(autostart_path))
+            self.assertFalse(os.path.exists(launcher_path))
 
 
 if __name__ == "__main__":

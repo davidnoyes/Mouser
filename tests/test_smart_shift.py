@@ -1,6 +1,8 @@
 """Tests for SmartShift (HID++ 0x2110/0x2111) across hid_gesture, engine, and backend."""
 
 import copy
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -192,6 +194,52 @@ class SmartShiftReadTests(unittest.TestCase):
         self.assertIsNone(listener._smart_shift_result)
 
 
+class SmartShiftPendingRequestAbortTests(unittest.TestCase):
+    def test_read_abort_returns_none_instead_of_stale_result(self):
+        listener = hid_gesture.HidGestureListener()
+        listener._smart_shift_result = {"mode": "ratchet", "enabled": True, "threshold": 30}
+        seen = []
+        done = threading.Event()
+
+        def worker():
+            seen.append(listener.read_smart_shift())
+            done.set()
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        for _ in range(50):
+            if listener._pending_smart_shift == "read":
+                break
+            time.sleep(0.01)
+        listener._abort_pending_smart_shift()
+        done.wait(1)
+        thread.join(timeout=1)
+
+        self.assertEqual(seen, [None])
+
+    def test_write_abort_returns_false_instead_of_stale_success(self):
+        listener = hid_gesture.HidGestureListener()
+        listener._smart_shift_result = True
+        seen = []
+        done = threading.Event()
+
+        def worker():
+            seen.append(listener.set_smart_shift("ratchet", False, 25))
+            done.set()
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        for _ in range(50):
+            if listener._pending_smart_shift == ("ratchet", False, 25):
+                break
+            time.sleep(0.01)
+        listener._abort_pending_smart_shift()
+        done.wait(1)
+        thread.join(timeout=1)
+
+        self.assertEqual(seen, [False])
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Engine — SmartShift config persistence and startup
 # ──────────────────────────────────────────────────────────────────────────────
@@ -209,6 +257,7 @@ class _FakeMouseHook:
 
     def set_debug_callback(self, cb): pass
     def set_gesture_callback(self, cb): pass
+    def set_status_callback(self, cb): pass
     def set_connection_change_callback(self, cb): pass
     def configure_gestures(self, **kwargs): pass
     def block(self, event_type): pass
@@ -301,17 +350,18 @@ class EngineSmartShiftTests(unittest.TestCase):
             engine.start()
         hg.set_smart_shift.assert_not_called()
 
-    def test_reconnect_reapplies_saved_smart_shift(self):
-        """_apply_device_settings pushes saved SmartShift to device (reconnect path)."""
+    def test_run_saved_settings_replay_reapplies_saved_smart_shift(self):
+        """Live replay pushes saved SmartShift to the device after reconnect."""
         engine = self._make_engine({
             "smart_shift_mode": "ratchet",
             "smart_shift_enabled": False,
             "smart_shift_threshold": 30,
         })
         hg = Mock(smart_shift_supported=True)
+        hg.connected_device = SimpleNamespace(name="MX Master 3S")
         engine.hook._hid_gesture = hg
         with patch("time.sleep"):
-            engine._apply_device_settings("reconnect")
+            engine._run_saved_settings_replay()
         hg.set_smart_shift.assert_called_with("ratchet", False, 30)
 
     def test_on_connection_change_spawns_battery_poll_thread(self):
@@ -336,21 +386,22 @@ class EngineSmartShiftTests(unittest.TestCase):
         thread_names = [c.kwargs.get("name") for c in thread_cls.call_args_list]
         self.assertIn("SavedSettingsReplay", thread_names)
 
-    def test_apply_device_settings_retries_on_failure(self):
+    def test_run_saved_settings_replay_retries_on_failure(self):
         """On write failure (e.g. IOReturnBadArgument right after wake), retry once."""
         engine = self._make_engine({
             "smart_shift_enabled": True,
             "smart_shift_threshold": 25,
         })
         hg = Mock(smart_shift_supported=True)
-        # First call fails (device not ready), second succeeds
+        hg.connected_device = SimpleNamespace(name="MX Master 3S")
+        # First call fails (immediate write), second succeeds (settled replay)
         hg.set_smart_shift.side_effect = [False, True]
         engine.hook._hid_gesture = hg
         with patch("time.sleep"):
-            engine._apply_device_settings("reconnect")
+            engine._run_saved_settings_replay()
         self.assertEqual(hg.set_smart_shift.call_count, 2)
 
-    def test_apply_device_settings_notifies_ui_with_saved_state(self):
+    def test_run_saved_settings_replay_notifies_ui_with_saved_state(self):
         """UI must show the saved config, not stale hardware state read by the poll."""
         engine = self._make_engine({
             "smart_shift_mode": "ratchet",
@@ -358,11 +409,12 @@ class EngineSmartShiftTests(unittest.TestCase):
             "smart_shift_threshold": 30,
         })
         hg = Mock(smart_shift_supported=True)
+        hg.connected_device = SimpleNamespace(name="MX Master 3S")
         engine.hook._hid_gesture = hg
         received = []
         engine.set_smart_shift_read_callback(received.append)
         with patch("time.sleep"):
-            engine._apply_device_settings("startup")
+            engine._run_saved_settings_replay()
         # UI is notified twice: once immediately, once after the settled 3 s delay.
         self.assertGreaterEqual(len(received), 2)
         self.assertEqual(received[-1], {
@@ -443,12 +495,32 @@ class BackendSmartShiftTests(unittest.TestCase):
         engine_mock.set_smart_shift.assert_called_once_with("ratchet", True, 45)
 
     def test_handle_smart_shift_read_updates_in_memory_config(self):
-        backend = self._make_backend()
+        backend = self._make_backend({"smart_shift_threshold": 42})
         with patch("ui.backend.save_config") as save_mock:
             # Simulate the two-step cross-thread call: stage state, then invoke handler
-            backend._pending_smart_shift_state = {"mode": "freespin", "enabled": True, "threshold": 35}
+            backend._pending_smart_shift_state = {"mode": "freespin", "enabled": False, "threshold": 35}
             backend._handleSmartShiftRead()
         # Hardware reads should NOT be persisted — user's explicit saves drive the file.
+        save_mock.assert_not_called()
+        self.assertEqual(backend._cfg["settings"]["smart_shift_mode"], "freespin")
+        self.assertFalse(backend._cfg["settings"]["smart_shift_enabled"])
+        self.assertEqual(backend._cfg["settings"]["smart_shift_threshold"], 42)
+
+    def test_handle_smart_shift_read_preserves_saved_fallback_mode_when_enabled(self):
+        backend = self._make_backend({
+            "smart_shift_mode": "freespin",
+            "smart_shift_enabled": True,
+            "smart_shift_threshold": 30,
+        })
+        with patch("ui.backend.save_config") as save_mock:
+            # Real hardware reads report enabled SmartShift as ratchet + threshold,
+            # which must not overwrite the user's saved fixed-mode fallback.
+            backend._pending_smart_shift_state = {
+                "mode": "ratchet",
+                "enabled": True,
+                "threshold": 35,
+            }
+            backend._handleSmartShiftRead()
         save_mock.assert_not_called()
         self.assertEqual(backend._cfg["settings"]["smart_shift_mode"], "freespin")
         self.assertTrue(backend._cfg["settings"]["smart_shift_enabled"])
@@ -674,7 +746,7 @@ class ConfigV7MigrationTests(unittest.TestCase):
             "switch_scroll_mode",
         )
 
-    def test_version_bumped_to_8(self):
+    def test_version_bumped_to_current(self):
         from core.config import _migrate
         migrated = _migrate(self._v6_config())
         self.assertEqual(migrated["version"], 13)
@@ -736,7 +808,7 @@ class ConfigV8MigrationTests(unittest.TestCase):
             "switch_scroll_mode",
         )
 
-    def test_version_bumped_to_8(self):
+    def test_version_bumped_to_current(self):
         from core.config import _migrate
         migrated = _migrate(self._v7_config())
         self.assertEqual(migrated["version"], 13)

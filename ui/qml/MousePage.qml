@@ -430,8 +430,7 @@ Item {
 
     function customLabel(actionId) {
         if (!actionId.startsWith("custom:")) return ""
-        var parts = actionId.substring(7).split("+")
-        return parts.map(function(p){return p.charAt(0).toUpperCase()+p.slice(1)}).join(" + ")
+        return backend.actionLabelFor(actionId)
     }
 
     function isCustomAction(actionId) {
@@ -884,7 +883,10 @@ Item {
                                     }
                                     Text {
                                         text: backend.mouseConnected
-                                              ? s["mouse.connected"] : s["mouse.not_connected"]
+                                              ? (s["mouse.connected"]
+                                                 + (backend.connectionType !== ""
+                                                    ? " · " + backend.connectionType : ""))
+                                              : s["mouse.not_connected"]
                                         font { family: uiState.fontFamily; pixelSize: 11 }
                                         color: backend.mouseConnected
                                                ? theme.accent : "#e05555"
@@ -979,7 +981,7 @@ Item {
 
                         Image {
                             id: mouseImg
-                            source: "file:///" + applicationDirPath + "/images/" + backend.deviceImageAsset
+                            source: backend.deviceImageSource
                             fillMode: Image.PreserveAspectFit
                             width: backend.deviceImageWidth
                             height: backend.deviceImageHeight
@@ -1403,14 +1405,16 @@ Item {
                                     }
                                 }
 
-                                Slider {
+                                WheelSafeSlider {
                                     id: gestureThresholdSlider
                                     width: parent.width
                                     from: 20
                                     to: 400
                                     stepSize: 5
                                     value: backend.gestureThreshold
-                                    Material.accent: theme.accent
+                                    accentColor: theme.accent
+                                    accentDimColor: theme.accentDim
+                                    trackColor: theme.border
                                     onMoved: gestureThresholdSave.restart()
                                     onPressedChanged: {
                                         if (!pressed) {
@@ -1724,7 +1728,7 @@ Item {
                                             }
                                         }
 
-                                        Slider {
+                                        WheelSafeSlider {
                                             id: dpiPresetSlider
                                             width: parent.width
                                             from: backend.deviceDpiMin
@@ -1735,7 +1739,9 @@ Item {
                                                 var idx = dpiPresetsCard.activeSlot
                                                 return presets[idx] !== undefined ? presets[idx] : 1000
                                             }
-                                            Material.accent: dpiPresetsCard.slotColors[dpiPresetsCard.activeSlot]
+                                            accentColor: dpiPresetsCard.slotColors[dpiPresetsCard.activeSlot]
+                                            accentDimColor: Qt.rgba(0.5, 0.5, 0.5, 0.12)
+                                            trackColor: theme.border
                                             onMoved: {
                                                 backend.setDpiPreset(dpiPresetsCard.activeSlot, Math.round(value))
                                             }

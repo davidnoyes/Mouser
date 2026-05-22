@@ -2,7 +2,7 @@ import QtQuick
 import QtQuick.Controls.Material
 import "Theme.js" as Theme
 
-/*  Modal dialog for entering a custom keyboard shortcut as text.
+/*  Modal dialog for capturing a custom keyboard shortcut.
     Emits captured(comboString) with e.g. "ctrl+shift+f5".  */
 
 Rectangle {
@@ -14,6 +14,8 @@ Rectangle {
     property string targetProfile: ""
     property bool _valid: false
     property string _preview: ""
+    property string _canonical: ""
+    property string _warning: ""
 
     signal captured(string comboString)
     signal cancelled()
@@ -29,6 +31,8 @@ Rectangle {
         shortcutField.text = ""
         _valid = false
         _preview = ""
+        _canonical = ""
+        _warning = ""
         visible = true
         shortcutField.forceActiveFocus()
     }
@@ -41,45 +45,87 @@ Rectangle {
         if (!text || !text.trim()) {
             _valid = false
             _preview = ""
+            _warning = ""
             return
         }
-        var modifiers = ["ctrl", "shift", "alt", "super"]
-        var parts = text.split("+")
-        var validNames = backend.validKeyNames
-        var validSet = {}
-        for (var i = 0; i < validNames.length; i++)
-            validSet[validNames[i]] = true
-        var labels = []
-        var seen = {}
-        var hasNonModifier = false
-        for (var j = 0; j < parts.length; j++) {
-            var name = parts[j].trim().toLowerCase()
-            if (!name) {
-                _valid = false
-                _preview = "\u2718 Empty key segment"
-                return
-            }
-            if (!validSet[name]) {
-                _valid = false
-                _preview = "\u2718 Unknown key: " + parts[j].trim()
-                return
-            }
-            if (seen[name]) {
-                _valid = false
-                _preview = "\u2718 Duplicate key: " + name
-                return
-            }
-            seen[name] = true
-            if (modifiers.indexOf(name) < 0) hasNonModifier = true
-            labels.push(name.charAt(0).toUpperCase() + name.slice(1))
-        }
-        if (!hasNonModifier) {
+        var canonical = backend.canonicalizeCustomShortcut(text)
+        if (!canonical) {
+            var reason = dialog._validationErrorText(
+                        backend.customShortcutValidationErrorInfo(text))
             _valid = false
-            _preview = "\u2718 Need at least one non-modifier key"
+            _canonical = ""
+            _preview = "\u2718 " + (reason || "Invalid shortcut")
+            _warning = ""
             return
         }
+        var parts = canonical.split("+")
+        var labels = []
+        for (var j = 0; j < parts.length; j++)
+            labels.push(dialog._displayKeyName(parts[j]))
         _valid = true
+        _canonical = canonical
         _preview = "\u2714 " + labels.join(" + ")
+        _warning = backend.isReservedCustomShortcut(canonical)
+                   ? s["key_capture.reserved_warning"]
+                   : ""
+    }
+
+    function _canonicalKeyName(name) {
+        var lowered = (name || "").trim().toLowerCase()
+        if (!lowered) return ""
+        if (lowered === "control") return "ctrl"
+        if (lowered === "option" || lowered === "opt") return "alt"
+        if (lowered === "cmd" || lowered === "command" || lowered === "meta"
+            || lowered === "win" || lowered === "windows") {
+            return "super"
+        }
+        return lowered
+    }
+
+    function _displayKeyName(name) {
+        var lowered = (name || "").trim().toLowerCase()
+        if (!lowered) return ""
+        if (lowered === "control") lowered = "ctrl"
+        if (lowered === "option" || lowered === "opt") lowered = "alt"
+        if (lowered === "cmd" || lowered === "command" || lowered === "meta"
+            || lowered === "win" || lowered === "windows") {
+            lowered = "super"
+        }
+        if (lowered.length === 1)
+            return lowered.toUpperCase()
+        return backend.displayShortcutKeyName(lowered)
+    }
+
+    function _validationErrorText(info) {
+        var code = info && info.code ? info.code : "unsupported"
+        var detail = info && info.detail ? info.detail : ""
+        var template = s["key_capture.error." + code]
+                       || s["key_capture.error.unsupported"]
+                       || "Shortcut is not supported."
+        return detail ? template.replace("%1", detail) : template.replace("%1", "")
+    }
+
+    function _comboFromEvent(event) {
+        if (!event) return ""
+        return backend.shortcutComboFromQtEvent(event.key, event.modifiers, event.text)
+    }
+
+    function _acceptKey(event) {
+        if (!event || event.isAutoRepeat)
+            return
+        if (event.modifiers === Qt.NoModifier
+                && (event.text || event.key === Qt.Key_Backspace
+                    || event.key === Qt.Key_Delete
+                    || event.key === Qt.Key_Left
+                    || event.key === Qt.Key_Right)) {
+            return
+        }
+        var combo = _comboFromEvent(event)
+        if (!combo)
+            return
+        shortcutField.text = combo
+        _validate(combo)
+        event.accepted = true
     }
 
     // Block clicks from reaching elements underneath
@@ -113,25 +159,32 @@ Rectangle {
                 width: parent.width
                 placeholderText: s["key_capture.placeholder"]
                 font { family: uiState.fontFamily; pixelSize: 13 }
+                readOnly: false
+                selectByMouse: true
+                inputMethodHints: Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
                 Material.accent: dialog.theme.accent
+                Keys.priority: Keys.BeforeItem
+                Keys.onPressed: function(event) { dialog._acceptKey(event) }
                 onTextChanged: dialog._validate(text)
-                Keys.onEscapePressed: { dialog.cancelled(); dialog.close() }
-                Keys.onReturnPressed: {
-                    if (dialog._valid) {
-                        var normalized = text.split("+").map(
-                            function(p) { return p.trim().toLowerCase() }
-                        ).join("+")
-                        dialog.captured(normalized)
-                        dialog.close()
-                    }
-                }
             }
 
             Text {
                 text: dialog._preview
+                width: parent.width
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
                 font { family: uiState.fontFamily; pixelSize: 12 }
                 color: dialog._valid ? "#4caf50" : "#f44336"
                 visible: dialog._preview !== ""
+            }
+
+            Text {
+                text: dialog._warning
+                width: parent.width
+                wrapMode: Text.WordWrap
+                font { family: uiState.fontFamily; pixelSize: 11 }
+                color: "#ffb74d"
+                visible: dialog._warning !== ""
             }
 
             Text {
@@ -185,10 +238,7 @@ Rectangle {
                                                    : Qt.ArrowCursor
                         onClicked: {
                             if (!dialog._valid) return
-                            var normalized = shortcutField.text.split("+").map(
-                                function(p) { return p.trim().toLowerCase() }
-                            ).join("+")
-                            dialog.captured(normalized)
+                            dialog.captured(dialog._canonical)
                             dialog.close()
                         }
                     }

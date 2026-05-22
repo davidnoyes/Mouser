@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+from core.logi_device_catalog import LOGI_DEVICE_LAYOUTS
+
 
 MX_MASTER_LAYOUT = {
     "key": "mx_master",
@@ -296,6 +298,7 @@ DEVICE_LAYOUTS = {
     "mx_anywhere": MX_ANYWHERE_LAYOUT,
     "mx_vertical": MX_VERTICAL_LAYOUT,
     "generic_mouse": GENERIC_MOUSE_LAYOUT,
+    **LOGI_DEVICE_LAYOUTS,
 }
 
 # Maps a device-specific key like "mx_master_3s" to its family layout key.
@@ -305,9 +308,9 @@ _FAMILY_FALLBACKS = {
     "mx_master_3s": "mx_master",
     "mx_master_3": "mx_master",
     "mx_master_2s": "mx_master",
+    "mx_anywhere_2s": "mx_anywhere",
     "mx_anywhere_3s": "mx_anywhere",
     "mx_anywhere_3": "mx_anywhere",
-    "mx_anywhere_2s": "mx_anywhere",
 }
 
 
