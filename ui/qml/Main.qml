@@ -26,6 +26,7 @@ ApplicationWindow {
                                                : (Qt.platform.os === "windows"
                                                   ? "Consolas"
                                                   : "monospace")
+    property var s: lm.strings
     property int currentPage: 0
     property Item hoveredNavItem: null
     property string hoveredNavText: ""

@@ -109,6 +109,11 @@ class AccessibilityLocaleTests(unittest.TestCase):
                         self.ENGLISH_VALUES,
                         f"{locale}.{key} still ships English",
                     )
+                self.assertNotEqual(
+                    _TRANSLATIONS[locale]["scroll.smart_shift"],
+                    "SmartShift",
+                    f"{locale}.scroll.smart_shift still ships English",
+                )
 
 
 if __name__ == "__main__":
