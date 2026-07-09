@@ -1,6 +1,7 @@
 import json
 import ntpath
 import os
+import plistlib
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -43,15 +44,18 @@ class ConfigMigrationTests(unittest.TestCase):
 
         migrated = config._migrate(legacy)
 
-        self.assertEqual(migrated["version"], 13)
+        self.assertEqual(migrated["version"], 15)
         self.assertEqual(migrated["profiles"]["default"]["apps"], [])
         self.assertFalse(migrated["settings"]["invert_hscroll"])
         self.assertFalse(migrated["settings"]["invert_vscroll"])
         self.assertEqual(migrated["settings"]["dpi"], 1000)
-        self.assertEqual(migrated["settings"]["gesture_threshold"], 50)
-        self.assertEqual(migrated["settings"]["gesture_deadzone"], 40)
-        self.assertEqual(migrated["settings"]["gesture_timeout_ms"], 3000)
-        self.assertEqual(migrated["settings"]["gesture_cooldown_ms"], 500)
+        self.assertEqual(
+            migrated["settings"]["gesture_threshold"],
+            config.GESTURE_SENSITIVITY_PX[config.GESTURE_DEFAULT_SENSITIVITY_INDEX],
+        )
+        self.assertEqual(migrated["settings"]["gesture_commit_window_ms"], 400)
+        self.assertEqual(migrated["settings"]["gesture_settle_ms"], 90)
+        self.assertEqual(migrated["settings"]["gesture_cross_ratio"], 0.5)
         self.assertEqual(migrated["settings"]["appearance_mode"], "system")
         self.assertFalse(migrated["settings"]["debug_mode"])
         self.assertEqual(migrated["settings"]["device_layout_overrides"], {})
@@ -89,7 +93,7 @@ class ConfigMigrationTests(unittest.TestCase):
 
         migrated = config._migrate(cfg)
 
-        self.assertEqual(migrated["version"], 13)
+        self.assertEqual(migrated["version"], 15)
         self.assertEqual(
             migrated["profiles"]["media"]["apps"],
             ["Microsoft.Media.Player.exe", "VLC.exe"],
@@ -103,6 +107,37 @@ class ConfigMigrationTests(unittest.TestCase):
         self.assertEqual(migrated["settings"]["update_check_state"], {})
         self.assertFalse(migrated["settings"]["start_at_login"])
         self.assertNotIn("start_with_windows", migrated["settings"])
+
+    def test_default_hscroll_threshold_supports_fractional_mac_deltas(self):
+        self.assertEqual(config.DEFAULT_CONFIG["settings"]["hscroll_threshold"], 0.1)
+
+    def test_load_config_preserves_integer_hscroll_threshold(self):
+        partial = {
+            "version": 9,
+            "active_profile": "default",
+            "profiles": {
+                "default": {
+                    "label": "Default",
+                    "apps": [],
+                    "mappings": {},
+                }
+            },
+            "settings": {
+                "hscroll_threshold": 1,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_file = Path(temp_dir) / "config.json"
+            config_file.write_text(json.dumps(partial), encoding="utf-8")
+
+            with (
+                patch.object(config, "CONFIG_DIR", temp_dir),
+                patch.object(config, "CONFIG_FILE", str(config_file)),
+            ):
+                loaded = config.load_config()
+
+        self.assertEqual(loaded["settings"]["hscroll_threshold"], 1)
 
     def test_load_config_merges_missing_defaults_from_disk(self):
         partial = {
@@ -132,12 +167,15 @@ class ConfigMigrationTests(unittest.TestCase):
             ):
                 loaded = config.load_config()
 
-        self.assertEqual(loaded["version"], 13)
+        self.assertEqual(loaded["version"], 15)
         self.assertEqual(loaded["settings"]["dpi"], 800)
         self.assertEqual(loaded["settings"]["action_haptic"], [])
         self.assertTrue(loaded["settings"]["haptic_enabled"])
         self.assertFalse(loaded["settings"]["start_at_login"])
-        self.assertEqual(loaded["settings"]["gesture_threshold"], 50)
+        self.assertEqual(
+            loaded["settings"]["gesture_threshold"],
+            config.GESTURE_SENSITIVITY_PX[config.GESTURE_DEFAULT_SENSITIVITY_INDEX],
+        )
         self.assertEqual(loaded["settings"]["appearance_mode"], "system")
         self.assertFalse(loaded["settings"]["debug_mode"])
         self.assertEqual(loaded["settings"]["device_layout_overrides"], {})
@@ -162,7 +200,7 @@ class ConfigMigrationTests(unittest.TestCase):
 
         migrated = config._migrate(legacy)
 
-        self.assertEqual(migrated["version"], 13)
+        self.assertEqual(migrated["version"], 15)
         self.assertTrue(migrated["settings"]["start_at_login"])
         self.assertEqual(
             migrated["profiles"]["default"]["mappings"]["mode_shift"],
@@ -188,16 +226,37 @@ class ConfigMigrationTests(unittest.TestCase):
 
         migrated = config._migrate(v8_cfg)
 
-        self.assertEqual(migrated["version"], 13)
+        self.assertEqual(migrated["version"], 15)
         self.assertEqual(
             migrated["profiles"]["default"]["mappings"]["actions_ring"], "none"
         )
         self.assertEqual(migrated["settings"]["haptic_level"], 2)
         self.assertEqual(migrated["profiles"]["default"]["button_haptic"], {})
 
-    def test_migrate_v9_to_v10_adds_button_haptic(self):
+    def test_migrate_v9_to_v10_adds_gesture_recognizer_params(self):
         v9_cfg = {
             "version": 9,
+            "active_profile": "default",
+            "profiles": {
+                "default": {
+                    "label": "Default",
+                    "apps": [],
+                    "mappings": {"middle": "none", "actions_ring": "none"},
+                },
+            },
+            "settings": {"dpi": 1000, "haptic_level": 2},
+        }
+
+        migrated = config._migrate(v9_cfg)
+
+        self.assertEqual(migrated["version"], 15)
+        self.assertEqual(migrated["settings"]["gesture_commit_window_ms"], 400)
+        self.assertEqual(migrated["settings"]["gesture_settle_ms"], 90)
+        self.assertEqual(migrated["settings"]["gesture_cross_ratio"], 0.5)
+
+    def test_migrate_v10_to_v11_adds_button_haptic(self):
+        v10_cfg = {
+            "version": 10,
             "active_profile": "default",
             "profiles": {
                 "default": {
@@ -214,15 +273,15 @@ class ConfigMigrationTests(unittest.TestCase):
             "settings": {"dpi": 1000, "haptic_level": 2},
         }
 
-        migrated = config._migrate(v9_cfg)
+        migrated = config._migrate(v10_cfg)
 
-        self.assertEqual(migrated["version"], 13)
+        self.assertEqual(migrated["version"], 15)
         self.assertEqual(migrated["profiles"]["default"]["button_haptic"], {})
         self.assertEqual(migrated["profiles"]["work"]["button_haptic"], {})
 
-    def test_migrate_v11_to_v12_adds_action_haptic_list(self):
-        v11_cfg = {
-            "version": 11,
+    def test_migrate_v12_to_v13_adds_action_haptic_list(self):
+        v12_cfg = {
+            "version": 12,
             "active_profile": "default",
             "profiles": {
                 "default": {
@@ -234,9 +293,9 @@ class ConfigMigrationTests(unittest.TestCase):
             "settings": {"dpi": 1000, "haptic_level": 2, "haptic_enabled": True},
         }
 
-        migrated = config._migrate(v11_cfg)
+        migrated = config._migrate(v12_cfg)
 
-        self.assertEqual(migrated["version"], 13)
+        self.assertEqual(migrated["version"], 15)
         self.assertEqual(migrated["settings"]["action_haptic"], [])
         # existing haptic settings preserved
         self.assertTrue(migrated["settings"]["haptic_enabled"])
@@ -270,9 +329,9 @@ class ConfigMigrationTests(unittest.TestCase):
             cfg = config.set_action_haptic(cfg, "cycle_dpi", False)
             self.assertEqual(cfg["settings"]["action_haptic"], ["volume_mute"])
 
-    def test_migrate_v12_to_v13_adds_button_haptic_and_dedup(self):
-        v12_cfg = {
-            "version": 12,
+    def test_migrate_v13_to_v14_adds_button_haptic_and_dedup(self):
+        v13_cfg = {
+            "version": 13,
             "active_profile": "default",
             "profiles": {
                 "default": {
@@ -285,9 +344,9 @@ class ConfigMigrationTests(unittest.TestCase):
                          "action_haptic": ["cycle_dpi"]},
         }
 
-        migrated = config._migrate(v12_cfg)
+        migrated = config._migrate(v13_cfg)
 
-        self.assertEqual(migrated["version"], 13)
+        self.assertEqual(migrated["version"], 15)
         self.assertEqual(migrated["settings"]["button_haptic"], [])
         self.assertTrue(migrated["settings"]["haptic_dedup"])
         # existing settings preserved
@@ -318,7 +377,7 @@ class ConfigMigrationTests(unittest.TestCase):
             cfg = config.set_button_haptic(cfg, "middle", False)  # no-op
             self.assertEqual(cfg["settings"]["button_haptic"], ["gesture"])
 
-    def test_get_profile_for_app_matches_aliases(self):
+    def test_get_profile_for_app_identity_matches_aliases(self):
         cfg = {
             "app_overrides": {},
             "profiles": {
@@ -336,11 +395,11 @@ class ConfigMigrationTests(unittest.TestCase):
             },
         ):
             self.assertEqual(
-                config.get_profile_for_app(cfg, "com.google.Chrome"),
+                config.get_profile_for_app_identity(cfg, ("com.google.Chrome",)),
                 "chrome",
             )
 
-    def test_get_profile_for_app_matches_linux_desktop_id_from_runtime_path(self):
+    def test_get_profile_for_app_identity_matches_linux_desktop_id_from_runtime_path(self):
         cfg = {
             "profiles": {
                 "default": {"apps": []},
@@ -362,11 +421,14 @@ class ConfigMigrationTests(unittest.TestCase):
             },
         ):
             self.assertEqual(
-                config.get_profile_for_app(cfg, "/usr/lib64/firefox/firefox"),
+                config.get_profile_for_app_identity(
+                    cfg,
+                    ("/usr/lib64/firefox/firefox",),
+                ),
                 "firefox",
             )
 
-    def test_get_profile_for_app_matches_linux_legacy_launcher_path(self):
+    def test_get_profile_for_app_identity_matches_linux_legacy_launcher_path(self):
         cfg = {
             "profiles": {
                 "default": {"apps": []},
@@ -388,8 +450,87 @@ class ConfigMigrationTests(unittest.TestCase):
             },
         ):
             self.assertEqual(
-                config.get_profile_for_app(cfg, "/usr/lib64/firefox/firefox"),
+                config.get_profile_for_app_identity(
+                    cfg,
+                    ("/usr/lib64/firefox/firefox",),
+                ),
                 "firefox",
+            )
+
+
+class SaveConfigTests(unittest.TestCase):
+    def test_save_config_writes_atomically_to_regular_file(self):
+        cfg = {"version": 9, "settings": {}, "profiles": {}}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_file = Path(temp_dir) / "config.json"
+            with (
+                patch.object(config, "CONFIG_DIR", temp_dir),
+                patch.object(config, "CONFIG_FILE", str(config_file)),
+            ):
+                config.save_config(cfg)
+
+            self.assertTrue(config_file.is_file())
+            self.assertFalse(config_file.is_symlink())
+            self.assertEqual(
+                json.loads(config_file.read_text(encoding="utf-8")), cfg
+            )
+
+    def test_save_config_preserves_symlinked_config_file(self):
+        """When CONFIG_FILE is a symlink (e.g. via GNU stow), save_config must
+        update the link target in place rather than replacing the link with a
+        regular file."""
+        cfg = {"version": 9, "settings": {}, "profiles": {}}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_dir = Path(temp_dir) / "Application Support" / "Mouser"
+            config_dir.mkdir(parents=True)
+            real_dir = Path(temp_dir) / "dotfiles" / "mouser"
+            real_dir.mkdir(parents=True)
+            real_target = real_dir / "config.json"
+            real_target.write_text("{}", encoding="utf-8")
+
+            symlink_path = config_dir / "config.json"
+            symlink_path.symlink_to(real_target)
+
+            with (
+                patch.object(config, "CONFIG_DIR", str(config_dir)),
+                patch.object(config, "CONFIG_FILE", str(symlink_path)),
+            ):
+                config.save_config(cfg)
+
+            self.assertTrue(
+                symlink_path.is_symlink(),
+                "save_config replaced the symlink with a regular file",
+            )
+            self.assertEqual(
+                os.readlink(str(symlink_path)), str(real_target)
+            )
+            self.assertEqual(
+                json.loads(real_target.read_text(encoding="utf-8")), cfg
+            )
+
+    def test_save_config_follows_broken_symlink_target(self):
+        """A dangling symlink should be repaired in place: the link survives and
+        now points at a valid file with the saved contents."""
+        cfg = {"version": 9, "settings": {}, "profiles": {}}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_dir = Path(temp_dir) / "cfg"
+            config_dir.mkdir()
+            real_dir = Path(temp_dir) / "real"
+            real_dir.mkdir()
+            real_target = real_dir / "config.json"  # does NOT exist yet
+            symlink_path = config_dir / "config.json"
+            symlink_path.symlink_to(real_target)
+
+            with (
+                patch.object(config, "CONFIG_DIR", str(config_dir)),
+                patch.object(config, "CONFIG_FILE", str(symlink_path)),
+            ):
+                config.save_config(cfg)
+
+            self.assertTrue(symlink_path.is_symlink())
+            self.assertTrue(real_target.is_file())
+            self.assertEqual(
+                json.loads(real_target.read_text(encoding="utf-8")), cfg
             )
 
 
@@ -507,7 +648,7 @@ class AppCatalogTests(unittest.TestCase):
 
         self.assertEqual(resolved["id"], "com.example.electron")
 
-    def test_get_profile_for_app_matches_mac_bundle_identity(self):
+    def test_get_profile_for_app_identity_matches_mac_bundle_identity(self):
         cfg = {
             "profiles": {
                 "default": {"apps": []},
@@ -519,17 +660,77 @@ class AppCatalogTests(unittest.TestCase):
 
         with _platform_catalog("darwin"):
             self.assertEqual(
-                config.get_profile_for_app(cfg, "org.mozilla.firefox"),
+                config.get_profile_for_app_identity(cfg, ("org.mozilla.firefox",)),
                 "firefox",
             )
             self.assertEqual(
-                config.get_profile_for_app(cfg, "com.todesktop.230313mzl4w4u92"),
+                config.get_profile_for_app_identity(
+                    cfg,
+                    ("com.todesktop.230313mzl4w4u92",),
+                ),
                 "cursor",
             )
             self.assertEqual(
-                config.get_profile_for_app(cfg, "com.microsoft.VSCodeInsiders"),
+                config.get_profile_for_app_identity(
+                    cfg,
+                    ("com.microsoft.VSCodeInsiders",),
+                ),
                 "code",
             )
+
+    def test_get_profile_for_app_identity_matches_mac_app_path_to_runtime_bundle_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app_path = os.path.join(tmp, "Windowed.app")
+            contents = os.path.join(app_path, "Contents")
+            os.makedirs(contents)
+            with open(os.path.join(contents, "Info.plist"), "wb") as f:
+                plistlib.dump({"CFBundleIdentifier": "com.example.Windowed"}, f)
+
+            cfg = {
+                "profiles": {
+                    "default": {"apps": []},
+                    "windowed": {"apps": [app_path]},
+                }
+            }
+
+            with (
+                _platform_catalog("darwin"),
+                patch.object(app_catalog, "get_app_catalog", return_value=[]),
+            ):
+                self.assertEqual(
+                    config.get_profile_for_app_identity(
+                        cfg,
+                        ("com.example.Windowed",),
+                    ),
+                    "windowed",
+                )
+
+    def test_get_profile_for_app_identity_prefers_specific_nested_identity(self):
+        cfg = {
+            "profiles": {
+                "default": {"apps": []},
+                "outer": {"apps": ["OuterHost"]},
+                "inner": {"apps": ["InnerTool"]},
+            }
+        }
+
+        self.assertEqual(
+            config.get_profile_for_app_identity(cfg, ("InnerTool", "OuterHost")),
+            "inner",
+        )
+
+    def test_get_profile_for_app_identity_falls_back_to_outer_nested_identity(self):
+        cfg = {
+            "profiles": {
+                "default": {"apps": []},
+                "outer": {"apps": ["OuterHost"]},
+            }
+        }
+
+        self.assertEqual(
+            config.get_profile_for_app_identity(cfg, ("InnerTool", "OuterHost")),
+            "outer",
+        )
 
     def test_resolve_app_spec_for_windows_exe_path_uses_curated_label(self):
         app_path = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
@@ -555,7 +756,7 @@ class AppCatalogTests(unittest.TestCase):
         self.assertEqual(resolved["id"], "WindowsTerminal.exe")
         self.assertEqual(resolved["label"], "Windows Terminal")
 
-    def test_get_profile_for_app_matches_windows_full_path(self):
+    def test_get_profile_for_app_identity_matches_windows_full_path(self):
         cfg = {
             "app_overrides": {},
             "profiles": {
@@ -577,9 +778,11 @@ class AppCatalogTests(unittest.TestCase):
             },
         ):
             self.assertEqual(
-                config.get_profile_for_app(
+                config.get_profile_for_app_identity(
                     cfg,
-                    r"C:\\Users\\luca\\AppData\\Local\\Microsoft\\WindowsApps\\wt.exe",
+                    (
+                        r"C:\\Users\\luca\\AppData\\Local\\Microsoft\\WindowsApps\\wt.exe",
+                    ),
                 ),
                 "terminal",
             )

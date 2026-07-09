@@ -4,6 +4,7 @@ current configuration.  Sits between the hook layer and the UI.
 Supports per-application auto-switching of profiles.
 """
 
+import sys
 import threading
 import time
 from core.mouse_hook import MouseHook, MouseEvent
@@ -12,9 +13,10 @@ from core.key_simulator import (
     inject_mouse_down, inject_mouse_up,
 )
 from core.config import (
-    load_config, get_active_mappings, get_profile_for_app,
+    load_config, get_active_mappings, get_profile_for_app_identity,
     BUTTON_TO_EVENTS, GESTURE_DIRECTION_BUTTONS, save_config,
     action_haptic_enabled, button_haptic_enabled,
+    WHEEL_DIVERT_OFF, coerce_wheel_divert_setting,
 )
 from core.app_detector import AppDetector
 from core.mouse_hook_types import HidRuntimeState
@@ -62,6 +64,9 @@ class Engine:
         self._battery_poll_stop = threading.Event()
         self._battery_poll_thread = None          # track the poller thread
         self._last_connection_state = bool(self._hid_runtime_state().input_ready)
+        self._wheel_divert_change_cb = None
+        self._wheel_divert_active_local = False
+        self._last_native_invert_target = (False, False)
         self._last_hid_features_ready = bool(self.hid_features_ready)
         self._hid_replay_requested_this_launch = False
         self._replay_inflight = False
@@ -111,11 +116,12 @@ class Engine:
         self.hook.configure_gestures(
             enabled=any(mappings.get(key, "none") != "none"
                         for key in GESTURE_DIRECTION_BUTTONS),
-            threshold=settings.get("gesture_threshold", 50),
-            deadzone=settings.get("gesture_deadzone", 40),
-            timeout_ms=settings.get("gesture_timeout_ms", 3000),
-            cooldown_ms=settings.get("gesture_cooldown_ms", 500),
+            threshold=settings.get("gesture_threshold", 25),
+            commit_window_ms=settings.get("gesture_commit_window_ms", 400),
+            settle_ms=settings.get("gesture_settle_ms", 90),
+            cross_ratio=settings.get("gesture_cross_ratio", 0.5),
         )
+        self._apply_wheel_invert_setting()
         # Divert mode shift CID only when the device has the button and
         # at least one profile maps it to an action.  When no device is
         # connected yet, assume the button exists (safe: if the device
@@ -222,6 +228,8 @@ class Engine:
                         self._switch_scroll_mode(btn_key)
                     elif action_id == "cycle_dpi":
                         self._cycle_dpi(btn_key)
+                    elif action_id == "cycle_desktops":
+                        self._cycle_desktops()
                     else:
                         execute_action(action_id)
             except Exception as exc:
@@ -365,6 +373,241 @@ class Engine:
                 hg.set_dpi(new_dpi)
             threading.Thread(target=_write, daemon=True, name="CycleDPI").start()
 
+    def _apply_wheel_invert_setting(self, *, force: bool = False) -> None:
+        settings = self.cfg.get("settings", {})
+        kill_switch_off = (
+            coerce_wheel_divert_setting(settings.get("wheel_divert")) == WHEEL_DIVERT_OFF
+        )
+        invert_v = bool(settings.get("invert_vscroll", False))
+        invert_h = bool(settings.get("invert_hscroll", False))
+        device = self.connected_device
+        capable = bool(device and (
+            getattr(device, "has_hires_wheel", False)
+            or getattr(device, "has_thumbwheel", False)
+        ))
+        target_active = bool(capable and not kill_switch_off)
+        hg = self.hook._hid_gesture
+        if (
+            not force
+            and target_active == self._wheel_divert_active_local
+            and target_active == bool(getattr(self.hook, "wheel_native_invert_active", False))
+            and (not target_active or self._last_native_invert_target == (invert_v, invert_h))
+        ):
+            return
+        ack = False
+        if target_active and hg is not None and hasattr(hg, "request_wheel_native_invert"):
+            try:
+                ack = bool(hg.request_wheel_native_invert(invert_v, invert_h))
+            except Exception as exc:
+                print(f"[Engine] wheel native-invert request failed: {exc}")
+                ack = False
+        elif not target_active and hg is not None and hasattr(hg, "request_wheel_native_invert"):
+            try:
+                hg.request_wheel_native_invert(False, False)
+            except Exception as exc:
+                print(f"[Engine] wheel native-invert release failed: {exc}")
+        new_active = bool(target_active and ack)
+        prev_active = self._wheel_divert_active_local
+        self._wheel_divert_active_local = new_active
+        self.hook.wheel_native_invert_active = new_active
+        self._last_native_invert_target = (invert_v, invert_h) if new_active else (False, False)
+        if hg is not None and hasattr(hg, "set_wheel_divert_active_flags"):
+            try:
+                hg.set_wheel_divert_active_flags(
+                    bool(new_active and invert_v
+                         and getattr(hg, "_hires_wheel_idx", None) is not None),
+                    bool(new_active and invert_h
+                         and getattr(hg, "_thumbwheel_idx", None) is not None),
+                )
+            except Exception as exc:
+                print(f"[Engine] set_wheel_divert_active_flags failed: {exc}")
+        if new_active != prev_active:
+            print(
+                f"[Engine] wheel native-invert -> "
+                f"{'ON (HID++)' if new_active else 'OFF (OS fallback)'} "
+                f"capable={capable} kill_switch_off={kill_switch_off} "
+                f"invert_v={invert_v} invert_h={invert_h} ack={ack}"
+            )
+            if not new_active and target_active:
+                self._emit_status(
+                    "Firmware wheel invert FAILED on a capable device -- "
+                    "falling back to OS-level inversion."
+                )
+            self._notify_wheel_divert_change(new_active)
+
+    def _notify_wheel_divert_change(self, active: bool) -> None:
+        if self._wheel_divert_change_cb is None:
+            return
+        try:
+            self._wheel_divert_change_cb(bool(active))
+        except Exception as exc:
+            print(f"[Engine] wheel divert change callback raised: {exc}")
+
+    def set_wheel_divert_change_callback(self, cb) -> None:
+        self._wheel_divert_change_cb = cb
+        if cb is None:
+            return
+        try:
+            cb(bool(self._wheel_divert_active_local))
+        except Exception as exc:
+            print(f"[Engine] wheel divert change callback (initial) raised: {exc}")
+
+    @property
+    def wheel_native_invert_active(self) -> bool:
+        return bool(self._wheel_divert_active_local)
+
+    @staticmethod
+    def _get_macos_desktop_info():
+        """Get macOS desktop count and current position (1-indexed).
+
+        Returns (desktop_count, current_position) for the display that
+        currently has the cursor.
+
+        Uses CGSGetActiveSpace to get the current space id64, then finds
+        which display's Spaces list contains that id64.  Only id64 values
+        inside the Spaces array are counted (not from "Current Space" or
+        "Collapsed Space" blocks).
+
+        Only works on macOS; returns (4, 1) on other platforms.
+        """
+        if sys.platform != "darwin":
+            return 4, 1
+
+        import ctypes
+        import subprocess
+        import re
+
+        try:
+            # CGSGetActiveSpace returns the current space id64 of the
+            # display where the cursor is located.
+            cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
+            cg.CGSGetActiveSpace.restype = ctypes.c_int32
+            current_id64 = cg.CGSGetActiveSpace()
+
+            # Read spaces config
+            result = subprocess.run(
+                ['defaults', 'read', 'com.apple.spaces', 'SpacesDisplayConfiguration'],
+                capture_output=True, text=True, timeout=5
+            )
+            output = result.stdout
+
+            # Split by Display Identifier to get per-monitor sections
+            sections = re.split(r'"Display Identifier"\s*=\s*', output)
+
+            def _extract_spaces_id64_list(section_text):
+                """Extract id64 values only from the Spaces array block."""
+                spaces_match = re.search(r'Spaces\s*=\s*\(', section_text)
+                if not spaces_match:
+                    return []
+                # Find the matching closing paren
+                text = section_text[spaces_match.start():]
+                depth = 0
+                end = 0
+                for i, c in enumerate(text):
+                    if c == '(':
+                        depth += 1
+                    elif c == ')':
+                        depth -= 1
+                        if depth == 0:
+                            end = i + 1
+                            break
+                if end == 0:
+                    return []
+                spaces_block = text[:end]
+                return [int(x) for x in re.findall(r'id64 = (\d+)', spaces_block)]
+
+            # Find the display whose Spaces list contains current_id64
+            active_display_id = None
+            active_id64_list = None
+
+            for section in sections[1:]:  # skip text before first identifier
+                display_id = section.split(';')[0].strip().strip('"')
+                id64_list = _extract_spaces_id64_list(section)
+                if current_id64 in id64_list:
+                    active_display_id = display_id
+                    active_id64_list = id64_list
+                    break
+
+            # Fallback: use Main display
+            if active_id64_list is None:
+                for section in sections[1:]:
+                    display_id = section.split(';')[0].strip().strip('"')
+                    if display_id == 'Main':
+                        active_display_id = 'Main'
+                        active_id64_list = _extract_spaces_id64_list(section)
+                        break
+
+            if not active_id64_list:
+                print("[Engine] No desktops found for active monitor")
+                return 4, 1
+
+            desktop_count = len(active_id64_list)
+
+            # Find current position (1-indexed)
+            if current_id64 in active_id64_list:
+                current_position = active_id64_list.index(current_id64) + 1
+            else:
+                current_position = 1
+
+            print(f"[Engine] macOS desktop info: display={active_display_id}, count={desktop_count}, "
+                  f"position={current_position}, id64={current_id64}, list={active_id64_list}")
+            return desktop_count, current_position
+
+        except Exception as e:
+            print(f"[Engine] Error getting macOS desktop info: {e}")
+            return 4, 1
+
+    def _cycle_desktops(self):
+        """Ping-pong cycle through desktops (macOS only).
+
+        Switches right until the last desktop, then left until the first,
+        then right again, etc.  Uses CGSGetActiveSpace and com.apple.spaces
+        to detect desktop count and current position.
+        """
+        if sys.platform != "darwin":
+            print("[Engine] cycle_desktops only supported on macOS")
+            return
+
+        settings = self.cfg.setdefault("settings", {})
+
+        # Get desktop info
+        desktop_count, current = self._get_macos_desktop_info()
+
+        # Only one desktop — nothing to cycle
+        if desktop_count <= 1:
+            print(f"[Engine] cycle_desktops: only {desktop_count} desktop, skipping")
+            return
+
+        # Read direction state
+        direction = settings.get("desktop_direction", "right")
+
+        # Calculate next position
+        if direction == "right":
+            if current >= desktop_count:
+                # At right edge, reverse
+                direction = "left"
+                next_pos = current - 1
+            else:
+                next_pos = current + 1
+        else:  # left
+            if current <= 1:
+                # At left edge, reverse
+                direction = "right"
+                next_pos = current + 1
+            else:
+                next_pos = current - 1
+
+        # Execute switch
+        print(f"[Engine] cycle_desktops: {current} -> {next_pos} (direction={direction})")
+        if next_pos > current:
+            execute_action("space_right")
+        else:
+            execute_action("space_left")
+
+        # Save direction state
+        settings["desktop_direction"] = direction
+        save_config(self.cfg)
+
     def _make_hscroll_handler(self, action_id):
         def handler(event):
             if not self._enabled:
@@ -405,19 +648,20 @@ class Engine:
 
     def _hscroll_threshold(self):
         return max(
-            0.1,
+            0.01,
             float(self.cfg.get("settings", {}).get("hscroll_threshold", 1)),
         )
 
     # ------------------------------------------------------------------
     # Per-app auto-switching
     # ------------------------------------------------------------------
-    def _on_app_change(self, exe_name: str):
+    def _on_app_change(self, app_identity: tuple[str, ...]):
         """Called by AppDetector when foreground window changes."""
-        target = get_profile_for_app(self.cfg, exe_name)
+        target = get_profile_for_app_identity(self.cfg, app_identity)
         if target == self._current_profile:
             return
-        print(f"[Engine] App changed to {exe_name} -> profile '{target}'")
+        app_label = app_identity[0] if app_identity else ""
+        print(f"[Engine] App changed to {app_label} -> profile '{target}'")
         self._switch_profile(target)
 
     def _switch_profile(self, profile_name: str):

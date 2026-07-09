@@ -749,7 +749,7 @@ class ConfigV7MigrationTests(unittest.TestCase):
     def test_version_bumped_to_current(self):
         from core.config import _migrate
         migrated = _migrate(self._v6_config())
-        self.assertEqual(migrated["version"], 13)
+        self.assertEqual(migrated["version"], 15)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -811,7 +811,7 @@ class ConfigV8MigrationTests(unittest.TestCase):
     def test_version_bumped_to_current(self):
         from core.config import _migrate
         migrated = _migrate(self._v7_config())
-        self.assertEqual(migrated["version"], 13)
+        self.assertEqual(migrated["version"], 15)
 
 
 class HidForceReconnectTests(unittest.TestCase):

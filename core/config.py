@@ -21,6 +21,7 @@ elif sys.platform == "linux":
 else:
     CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Mouser")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+DEVICE_CACHE_FILE = os.path.join(CONFIG_DIR, "device_cache.json")
 
 # Which mouse events map to which friendly button names
 # Order matches the Logi Options+ diagram (top view then side view)
@@ -34,6 +35,7 @@ BUTTON_NAMES = {
     "mode_shift":    "Mode shift button",
     "dpi_switch":    "DPI switch button",
     "actions_ring":  "Actions Ring button",
+    "thumb_button":  "Thumb button",
 }
 
 GESTURE_DIRECTION_BUTTONS = (
@@ -42,6 +44,36 @@ GESTURE_DIRECTION_BUTTONS = (
     "gesture_up",
     "gesture_down",
 )
+
+GESTURE_SENSITIVITY_PX = (18, 25, 33, 44, 56)
+GESTURE_DEFAULT_SENSITIVITY_INDEX = 1
+
+
+def gesture_sensitivity_index_for(threshold_px):
+    """Return the sensitivity preset index nearest to a stored px threshold."""
+    return min(
+        range(len(GESTURE_SENSITIVITY_PX)),
+        key=lambda i: abs(GESTURE_SENSITIVITY_PX[i] - int(threshold_px)),
+    )
+
+
+WHEEL_DIVERT_AUTO = "auto"
+WHEEL_DIVERT_OFF = "off"
+WHEEL_DIVERT_VALID_VALUES: frozenset[str] = frozenset((WHEEL_DIVERT_AUTO, WHEEL_DIVERT_OFF))
+WHEEL_DIVERT_DEFAULT = WHEEL_DIVERT_AUTO
+
+_WHEEL_DIVERT_WARNED: set[str] = set()
+
+
+def coerce_wheel_divert_setting(value: object) -> str:
+    """Normalize a stored wheel_divert value to a valid constant."""
+    if isinstance(value, str) and value in WHEEL_DIVERT_VALID_VALUES:
+        return value
+    key = repr(value)
+    if key not in _WHEEL_DIVERT_WARNED:
+        _WHEEL_DIVERT_WARNED.add(key)
+        print(f"[Config] wheel_divert={key!s} is not valid; using {WHEEL_DIVERT_DEFAULT!r}")
+    return WHEEL_DIVERT_DEFAULT
 
 PROFILE_BUTTON_NAMES = {
     **BUTTON_NAMES,
@@ -66,10 +98,11 @@ BUTTON_TO_EVENTS = {
     "mode_shift":    ("mode_shift_down", "mode_shift_up"),
     "dpi_switch":    ("dpi_switch_down", "dpi_switch_up"),
     "actions_ring":  ("actions_ring_down", "actions_ring_up"),
+    "thumb_button":  ("thumb_button_down", "thumb_button_up"),
 }
 
 DEFAULT_CONFIG = {
-    "version": 13,
+    "version": 15,
     "active_profile": "default",
     "profiles": {
         "default": {
@@ -88,6 +121,7 @@ DEFAULT_CONFIG = {
                 "hscroll_right": "browser_forward",
                 "mode_shift": "switch_scroll_mode",
                 "actions_ring": "none",
+                "thumb_button": "none",
             },
             "button_haptic": {},  # per-button haptic override; absent key = enabled (True)
         }
@@ -95,17 +129,17 @@ DEFAULT_CONFIG = {
     "settings": {
         "start_minimized": True,
         "start_at_login": False,
-        "hscroll_threshold": 1,
+        "hscroll_threshold": 0.1,
         "invert_hscroll": False,  # swap horizontal scroll directions
         "invert_vscroll": False,  # swap vertical scroll directions
         "dpi": 1000,              # pointer speed / DPI setting
         "smart_shift_mode": "ratchet",
         "smart_shift_enabled": False,
         "smart_shift_threshold": 25,
-        "gesture_threshold": 50,
-        "gesture_deadzone": 40,
-        "gesture_timeout_ms": 3000,
-        "gesture_cooldown_ms": 500,
+        "gesture_threshold": GESTURE_SENSITIVITY_PX[GESTURE_DEFAULT_SENSITIVITY_INDEX],
+        "gesture_commit_window_ms": 400,
+        "gesture_settle_ms": 90,
+        "gesture_cross_ratio": 0.5,
         "appearance_mode": "system",
         "debug_mode": False,
         "device_layout_overrides": {},
@@ -117,6 +151,7 @@ DEFAULT_CONFIG = {
         "haptic_dedup": True,       # True = deduplicate pulses within 100ms window
         "ignore_trackpad": True,
         "screenshot_directory": "",
+        "wheel_divert": WHEEL_DIVERT_DEFAULT,
         "check_for_updates": True,
         "update_check_state": {},
     },
@@ -183,24 +218,46 @@ def load_config():
     return json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
 
 
-def save_config(cfg):
-    """Persist config to disk via atomic write with restrictive permissions."""
+def _atomic_write_json(path, obj):
+    """Write a JSON object to *path* atomically with restrictive permissions."""
     ensure_config_dir()
-    fd, tmp_path = tempfile.mkstemp(suffix=".tmp", dir=CONFIG_DIR)
+    target_path = os.path.realpath(path)
+    target_dir = os.path.dirname(target_path) or CONFIG_DIR
+    fd, tmp_path = tempfile.mkstemp(suffix=".tmp", dir=target_dir)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
+            json.dump(obj, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
         if sys.platform != "win32":
             os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)
-        os.replace(tmp_path, CONFIG_FILE)
+        os.replace(tmp_path, target_path)
     except BaseException:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
         raise
+
+
+def save_config(cfg):
+    """Persist config to disk via atomic write with restrictive permissions."""
+    _atomic_write_json(CONFIG_FILE, cfg)
+
+
+def load_device_cache():
+    """Return the last-good HID++ device identity dict, or None."""
+    try:
+        with open(DEVICE_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def save_device_cache(identity):
+    """Persist the last-good HID++ device identity (atomic write)."""
+    _atomic_write_json(DEVICE_CACHE_FILE, identity)
 
 
 def get_active_mappings(cfg):
@@ -309,16 +366,67 @@ def resolve_app_for_config(spec: str):
     return app_catalog.resolve_app_spec(spec)
 
 
-def get_profile_for_app(cfg, exe_name):
-    """Return the profile name that matches the given executable, or 'default'."""
-    if not exe_name:
+def _dedupe_specs(candidates) -> list[str]:
+    result = []
+    seen = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate = str(candidate)
+        key = candidate.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(candidate)
+    return result
+
+
+def _identity_specs(app_identity: tuple[str, ...] | None) -> list[str]:
+    return _dedupe_specs(app_identity or ())
+
+
+def _configured_app_specs(app_spec: str | None) -> list[str]:
+    return _dedupe_specs((app_spec,) if app_spec else ())
+
+
+def _app_identity_aliases(spec: str) -> set[str]:
+    if not spec:
+        return set()
+    entry = resolve_app_for_config(spec)
+    if not entry:
+        return {spec.casefold()}
+    aliases = [entry.get("id", ""), *entry.get("aliases", [])]
+    return {alias.casefold() for alias in aliases if alias}
+
+
+def get_profile_for_app_identity(cfg, app_identity: tuple[str, ...] | None) -> str:
+    """
+    Return the profile name that matches an app identity, or 'default'.
+
+    ``app_identity`` is an ordered tuple of identifiers. Identifiers are matched
+    most-specific first, allowing a nested app profile to win before falling
+    back to its host app profile.
+    """
+    identities = _identity_specs(app_identity)
+    if not identities:
         return "default"
-    entry = resolve_app_for_config(exe_name)
-    aliases = {a.lower() for a in ([entry["id"]] + entry.get("aliases", []))} if entry else {exe_name.lower()}
-    for pname, pdata in cfg.get("profiles", {}).items():
-        for app in pdata.get("apps", []):
-            if app.lower() in aliases:
-                return pname
+
+    alias_cache = {}
+
+    def aliases_for(spec: str) -> set[str]:
+        key = spec.casefold()
+        if key not in alias_cache:
+            alias_cache[key] = _app_identity_aliases(spec)
+        return alias_cache[key]
+
+    profiles = list(cfg.get("profiles", {}).items())
+    for identity in identities:
+        aliases = aliases_for(identity)
+        for pname, pdata in profiles:
+            for app in pdata.get("apps", []):
+                for app_spec in _configured_app_specs(app):
+                    if aliases & aliases_for(app_spec):
+                        return pname
     return "default"
 
 
@@ -337,10 +445,10 @@ def _migrate(cfg):
 
     if version < 3:
         settings = cfg.setdefault("settings", {})
-        settings.setdefault("gesture_threshold", 50)
-        settings.setdefault("gesture_deadzone", 40)
-        settings.setdefault("gesture_timeout_ms", 3000)
-        settings.setdefault("gesture_cooldown_ms", 500)
+        settings.setdefault(
+            "gesture_threshold",
+            GESTURE_SENSITIVITY_PX[GESTURE_DEFAULT_SENSITIVITY_INDEX],
+        )
         for pdata in cfg.get("profiles", {}).values():
             mappings = pdata.setdefault("mappings", {})
             mappings.setdefault("gesture", "none")
@@ -401,27 +509,44 @@ def _migrate(cfg):
         cfg["version"] = 9
 
     if version < 10:
-        # v9 -> v10: add per-button haptic override dict to each profile.
-        for pdata in cfg.get("profiles", {}).values():
-            pdata.setdefault("button_haptic", {})
+        # v9 -> v10: gesture recognizer rewrite — add stroke-aware params.
+        settings = cfg.setdefault("settings", {})
+        settings.setdefault("gesture_commit_window_ms", 400)
+        settings.setdefault("gesture_settle_ms", 90)
+        settings.setdefault("gesture_cross_ratio", 0.5)
         cfg["version"] = 10
 
     if version < 11:
-        # v10 -> v11: add global haptic enabled flag.
-        cfg.setdefault("settings", {}).setdefault("haptic_enabled", True)
+        # v10 -> v11: MX4 dual-CID model — wheel_divert + thumb_button.
+        settings = cfg.setdefault("settings", {})
+        settings.setdefault("wheel_divert", WHEEL_DIVERT_DEFAULT)
+        for pdata in cfg.get("profiles", {}).values():
+            mappings = pdata.setdefault("mappings", {})
+            mappings.setdefault("thumb_button", "none")
         cfg["version"] = 11
 
     if version < 12:
-        # v11 -> v12: add per-action haptic allowlist (empty = opt-in).
-        cfg.setdefault("settings", {}).setdefault("action_haptic", [])
+        # v11 -> v12: add per-button haptic override dict to each profile.
+        for pdata in cfg.get("profiles", {}).values():
+            pdata.setdefault("button_haptic", {})
         cfg["version"] = 12
 
     if version < 13:
-        # v12 -> v13: add per-button haptic allowlist and dedup flag.
+        # v12 -> v13: add global haptic enabled flag.
+        cfg.setdefault("settings", {}).setdefault("haptic_enabled", True)
+        cfg["version"] = 13
+
+    if version < 14:
+        # v13 -> v14: add per-action haptic allowlist (empty = opt-in).
+        cfg.setdefault("settings", {}).setdefault("action_haptic", [])
+        cfg["version"] = 14
+
+    if version < 15:
+        # v14 -> v15: add per-button haptic allowlist and dedup flag.
         s = cfg.setdefault("settings", {})
         s.setdefault("button_haptic", [])
         s.setdefault("haptic_dedup", True)
-        cfg["version"] = 13
+        cfg["version"] = 15
 
     cfg.setdefault("settings", {})
     cfg["settings"].setdefault("appearance_mode", "system")
@@ -432,6 +557,9 @@ def _migrate(cfg):
     cfg["settings"].setdefault("screenshot_directory", "")
     cfg["settings"].setdefault("check_for_updates", True)
     cfg["settings"].setdefault("update_check_state", {})
+    cfg["settings"]["wheel_divert"] = coerce_wheel_divert_setting(
+        cfg["settings"].get("wheel_divert", WHEEL_DIVERT_DEFAULT)
+    )
 
     # Always migrate old wmplayer.exe → Microsoft.Media.Player.exe in profile apps
     for pdata in cfg.get("profiles", {}).values():
@@ -453,6 +581,16 @@ def _merge_defaults(cfg, defaults):
     return cfg
 
 
+
+def _is_compatible_type(value, default_val):
+    """Return True for values that are safe despite differing exact types."""
+    return (
+        isinstance(default_val, float)
+        and isinstance(value, int)
+        and not isinstance(value, bool)
+    )
+
+
 def _validate_types(cfg, defaults, path=""):
     """Reset values whose type doesn't match the defaults template."""
     for key, default_val in defaults.items():
@@ -465,6 +603,8 @@ def _validate_types(cfg, defaults, path=""):
                 print(f"[Config] Type mismatch at {path}.{key}: "
                       f"expected dict, got {type(cfg[key]).__name__}")
                 cfg[key] = json.loads(json.dumps(default_val))
+        elif _is_compatible_type(cfg[key], default_val):
+            continue
         elif not isinstance(cfg[key], type(default_val)):
             print(f"[Config] Type mismatch at {path}.{key}: "
                   f"expected {type(default_val).__name__}, "
