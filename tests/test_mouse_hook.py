@@ -682,7 +682,6 @@ class LinuxMouseHookReconnectTests(unittest.TestCase):
             patch.object(hook, "_setup_evdev", side_effect=fake_setup),
             patch.object(hook, "_listen_loop", side_effect=fake_listen),
             patch.object(hook, "_cleanup_evdev", side_effect=fake_cleanup),
-            patch.object(module.time, "sleep", return_value=None),
         ):
             hook._evdev_loop()
 

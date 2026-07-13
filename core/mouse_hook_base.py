@@ -113,6 +113,13 @@ class BaseMouseHook:
         self._callbacks.clear()
         self._blocked_events.clear()
 
+    def configure_wheel_multipliers(self, v, h):
+        """No-op kept for interface-shape compatibility.
+
+        Native-invert mode does no scroll injection, so wheel multipliers are
+        unused here; subclasses that inject scroll may override this."""
+        return None
+
     def configure_gestures(
         self,
         enabled=False,
